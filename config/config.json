@@ -1,0 +1,27 @@
+{
+  "artifacts_dir": "/opt/webids-capstone/artifacts",
+  "conn_log_path": "/opt/zeek/logs/current/conn.log",
+  "flowmeter_log_path": "/opt/zeek/logs/current/flowmeter.log",
+  "output_jsonl": "/opt/webids-capstone/logs/inference/predictions.jsonl",
+  "worker_log_path": "/opt/webids-capstone/logs/inference/worker.log",
+  "state_dir": "/opt/webids-capstone/state",
+  "poll_interval_seconds": 1.0,
+  "batch_size": 500,
+  "conn_cache_ttl_seconds": 900,
+  "pending_flow_ttl_seconds": 600,
+  "start_at_end": true,
+  "model_name": "RF-WEBIDS23",
+  "model_version": "2.0.0",
+  "internal_networks": [
+    "192.168.1.0/24",
+    "10.0.0.0/8"
+  ],
+  "direction_labels": {
+    "inbound": "inbound",
+    "outbound": "outbound",
+    "internal": "internal",
+    "external": "external",
+    "unknown": "Unknown"
+  },
+  "log_level": "INFO"
+}
