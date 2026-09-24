@@ -50,8 +50,8 @@ echo "[INFO] OS terdeteksi: $PRETTY_NAME"
 SKIP_ML=false
 if [ "$OS_ID" = "centos" ]; then
     SKIP_ML=true
-    echo "[INFO] CentOS terdeteksi - instalasi ML (inference worker, Zeek, FlowMeter) akan di-skip."
-    echo "[INFO] File monitoring juga akan di-skip (inotify-tools tidak tersedia di CentOS 7)."
+    echo "[INFO] $PRETTY_NAME terdeteksi - instalasi ML (inference worker, Zeek, FlowMeter) akan di-skip."
+    echo "[INFO] File monitoring juga akan di-skip (inotify-tools tidak tersedia)."
     echo "[INFO] Fitur lain (Filebeat, command logging) tetap akan diinstall."
 fi
 
@@ -70,6 +70,9 @@ install_basic_dependencies_apt() {
         build-essential swig libssl-dev \
         inotify-tools libimage-exiftool-perl \
         lsb-release unzip
+
+    echo "[INFO] Install build dependencies untuk Zeek..."
+    apt-get install -y cmake flex bison libpcap-dev zlib1g-dev
 }
 
 install_basic_dependencies_yum() {
@@ -77,11 +80,10 @@ install_basic_dependencies_yum() {
     yum install -y curl wget gnupg ca-certificates git \
         python3 python3-pip python3-devel \
         gcc gcc-c++ make openssl-devel \
-        yum-utils unzip
+        yum-utils unzip inotify-tools
 
     # Optional packages - jika tidak ada, skip
     echo "[INFO] Install optional packages..."
-    yum install -y inotify-tools || true
     yum install -y perl-Image-ExifTool || true
     yum install -y swig || true
 }
@@ -91,11 +93,13 @@ install_basic_dependencies_dnf() {
     dnf install -y curl wget gnupg ca-certificates git \
         python3 python3-pip python3-devel \
         gcc gcc-c++ make openssl-devel \
-        dnf-plugins-core unzip
+        dnf-plugins-core unzip inotify-tools
+
+    echo "[INFO] Install build dependencies untuk Zeek..."
+    dnf install -y cmake flex bison libpcap-devel zlib-devel
 
     # Optional packages - jika tidak ada, skip
     echo "[INFO] Install optional packages..."
-    dnf install -y inotify-tools || true
     dnf install -y perl-Image-ExifTool || true
     dnf install -y swig || true
 }
@@ -104,6 +108,9 @@ install_basic_dependencies_dnf() {
 # Setup Python Environment
 # ==================================================
 setup_python_environment() {
+    # Ensure valid working directory for pip operations
+    cd /tmp
+    
     echo "[INFO] Mengecek Python 3 dan pip..."
 
     if ! command_exists python3; then
@@ -123,10 +130,26 @@ setup_python_environment() {
     pip3 install --upgrade pip setuptools wheel
 
     if [ "$SKIP_ML" = true ]; then
-        echo "[INFO] SKIP: dependency ML inference worker (pandas, scikit-learn, joblib) di-skip untuk CentOS."
+        echo "[INFO] SKIP: dependency ML inference worker (pandas, scikit-learn, joblib) di-skip untuk $PRETTY_NAME."
     else
         echo "[INFO] Install Python dependencies untuk ML inference worker..."
-        pip3 install pandas==2.3.0 scikit-learn==1.7.0 joblib==1.5.1 psycopg2-binary python-dotenv
+        
+        # Detect Python version untuk compatibility
+        PYTHON_VERSION=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')
+        echo "[INFO] Python version terdeteksi: $PYTHON_VERSION"
+        
+        # Install sesuai Python version
+        if [ "$PYTHON_VERSION" = "3.9" ]; then
+            echo "[INFO] Python 3.9 - install scikit-learn 1.6.x (compatible)"
+            pip3 install pandas==2.3.0 scikit-learn==1.6.1 joblib==1.5.1 psycopg2-binary python-dotenv
+        elif [ "$PYTHON_VERSION" = "3.10" ]; then
+            echo "[INFO] Python 3.10 - install scikit-learn 1.7.x (compatible)"
+            pip3 install pandas==2.3.0 scikit-learn==1.7.0 joblib==1.5.1 psycopg2-binary python-dotenv
+        else
+            # Python 3.11+ atau yang lain - gunakan latest compatible
+            echo "[INFO] Python $PYTHON_VERSION - install latest compatible versions"
+            pip3 install pandas scikit-learn joblib psycopg2-binary python-dotenv
+        fi
     fi
 
     echo "[INFO] Install Python dependencies untuk malware file monitor..."
@@ -425,15 +448,241 @@ install_zeek_apt() {
     echo "[OK] Zeek berhasil diinstall."
 }
 
+# ==================================================
+# Install Zeek dari EPEL Repository (AlmaLinux/RHEL)
+# ==================================================
+install_zeek_from_epel() {
+    # PENTING: sebelumnya function ini langsung "return" di sini kalau Zeek
+    # SUDAH terinstall (misal dari run install.sh sebelumnya) - akibatnya
+    # install_flowmeter_epel() di bagian bawah TIDAK PERNAH terpanggil sama
+    # sekali pada run kedua dan seterusnya, walaupun FlowMeter belum pernah
+    # berhasil ter-load. Ini penyebab utama "@load flowmeter" tidak pernah
+    # muncul di local.zeek meski script "sukses" tanpa error.
+    #
+    # Fix: kalau Zeek sudah terinstall, skip instalasi paket Zeek saja,
+    # tapi tetap lanjut cek/instal FlowMeter di bawah.
+    ZEEK_ALREADY_INSTALLED=false
+    if command -v zeek &> /dev/null; then
+        echo "[OK] Zeek sudah terinstall: $(zeek --version)"
+        ZEEK_ALREADY_INSTALLED=true
+    fi
+
+    if [ "$ZEEK_ALREADY_INSTALLED" = false ]; then
+        echo "[INFO] Install Zeek dari EPEL repository..."
+
+        # Enable EPEL if not already
+        if ! grep -q "^enabled=1" /etc/yum.repos.d/epel.repo 2>/dev/null; then
+            echo "[INFO] Enabling EPEL repository..."
+            if command -v dnf &> /dev/null; then
+                sudo dnf config-manager --set-enabled epel || true
+            else
+                sudo yum-config-manager --enable epel || true
+            fi
+        fi
+
+        # Install zeek packages dari EPEL
+        echo "[INFO] Menginstall zeek-core, zeekctl, dan zeek-zkg dari EPEL..."
+        if command -v dnf &> /dev/null; then
+            dnf install -y zeek-core zeekctl zeek-zkg
+        else
+            yum install -y zeek-core zeekctl zeek-zkg
+        fi
+
+        # Fix EPEL paths (bukan /opt/zeek tapi /var/spool/zeek dan /var/log/zeek)
+        echo "[INFO] Fix permission untuk Zeek directories (EPEL paths)..."
+        sudo chown -R root:root /var/spool/zeek 2>/dev/null || true
+        sudo chmod -R 755 /var/spool/zeek 2>/dev/null || true
+        sudo chown -R root:root /var/log/zeek 2>/dev/null || true
+        sudo chmod -R 755 /var/log/zeek 2>/dev/null || true
+
+        # Auto-configure network interface untuk EPEL
+        echo "[INFO] Mengkonfigurasi Zeek network interface..."
+        configure_zeek_epel
+
+        echo "[OK] Zeek berhasil diinstall dari EPEL."
+    fi
+
+    # Install FlowMeter plugin - SELALU dicek/dijalankan, baik Zeek baru
+    # diinstall maupun sudah ada dari sebelumnya. install_flowmeter_epel()
+    # sendiri sudah idempotent (skip kalau sudah ke-load di local.zeek).
+    echo "[INFO] Install FlowMeter plugin via zkg..."
+    install_flowmeter_epel
+}
+
+# ==================================================
+# Install FlowMeter untuk EPEL Zeek
+# ==================================================
+install_flowmeter_epel() {
+    echo "[INFO] Installing FlowMeter plugin..."
+
+    # Cari binary zkg - bisa di PATH biasa atau di lokasi umum lainnya
+    ZKG_BIN=""
+    if command -v zkg &> /dev/null; then
+        ZKG_BIN="$(command -v zkg)"
+    elif [ -x /opt/zeek/bin/zkg ]; then
+        ZKG_BIN="/opt/zeek/bin/zkg"
+    elif [ -x /usr/bin/zkg ]; then
+        ZKG_BIN="/usr/bin/zkg"
+    fi
+
+    if [ -z "$ZKG_BIN" ]; then
+        echo "[WARNING] zkg tidak ditemukan (dicek di PATH, /opt/zeek/bin, /usr/bin). FlowMeter skip."
+        return
+    fi
+    echo "[INFO] zkg ditemukan: $ZKG_BIN"
+
+    # zkg butuh konfigurasi (state_dir/script_dir/plugin_dir) sebelum bisa install.
+    # Paket zeek-zkg dari EPEL biasanya sudah punya config bawaan, tapi kalau belum
+    # ada sama sekali, jalankan autoconfig dulu supaya tidak macet/gagal aneh.
+    if [ ! -f "$HOME/.zkg/config" ] && [ ! -f /etc/zkg/config ] && [ ! -f /root/.zkg/config ]; then
+        echo "[INFO] zkg belum ada konfigurasi, menjalankan '$ZKG_BIN autoconfig --force'..."
+        "$ZKG_BIN" autoconfig --force || true
+    fi
+
+    # Install FlowMeter via zkg menggunakan GitHub URL (tidak ada di zkg search index).
+    #
+    # PENTING - dua bug yang bikin FlowMeter GAGAL ter-load sebelumnya:
+    #   1. "zkg install ... | tail -3" -> exit status yang dicek oleh "if" adalah
+    #      punya "tail", BUKAN punya "zkg install". Jadi blok "berhasil" selalu
+    #      jalan meskipun instalasi FlowMeter aslinya gagal.
+    #   2. "zkg install" tanpa "--force" akan menampilkan prompt konfirmasi
+    #      interaktif (Y/n). Karena outputnya di-pipe ke "tail", prompt itu
+    #      tidak pernah terlihat di layar -> script seolah "diam"/hang, padahal
+    #      sebenarnya sedang menunggu input yang tidak pernah datang.
+    #
+    # Fix: output ditulis ke log file (bukan di-pipe langsung), exit code diambil
+    # dari zkg langsung, dan "--force" dipakai supaya tidak ada prompt interaktif.
+    echo "[INFO] Installing FlowMeter dari GitHub..."
+    ZKG_LOG="/tmp/zkg_flowmeter_install.log"
+    "$ZKG_BIN" install --force https://github.com/zeek-flowmeter/zeek-flowmeter > "$ZKG_LOG" 2>&1
+    ZKG_STATUS=$?
+
+    echo "[INFO] --- output zkg install (20 baris terakhir) ---"
+    tail -20 "$ZKG_LOG"
+    echo "[INFO] --- log lengkap: $ZKG_LOG ---"
+
+    if [ "$ZKG_STATUS" -eq 0 ]; then
+        echo "[OK] FlowMeter berhasil diinstall"
+
+        # Add @load directive ke local.zeek untuk load FlowMeter
+        load_flowmeter_in_local_zeek "$ZKG_BIN"
+    else
+        echo "[WARNING] FlowMeter installation gagal (exit code $ZKG_STATUS). Lihat $ZKG_LOG untuk detail."
+    fi
+}
+
+# ==================================================
+# Load FlowMeter di local.zeek
+# ==================================================
+load_flowmeter_in_local_zeek() {
+    local ZKG_BIN="${1:-zkg}"
+
+    # Detect path based on OS
+    if [ "$OS_ID" = "almalinux" ]; then
+        LOCAL_ZEEK="/usr/share/zeek/site/local.zeek"  # EPEL package path
+    else
+        LOCAL_ZEEK="/opt/zeek/etc/local.zeek"  # Build-from-source path (Ubuntu/Debian/RHEL/CentOS)
+    fi
+
+    # Check jika file ada
+    if [ ! -f "$LOCAL_ZEEK" ]; then
+        echo "[WARNING] local.zeek tidak ditemukan di $LOCAL_ZEEK"
+        return
+    fi
+
+    # Check jika FlowMeter sudah di-load (anchor ^ supaya tidak ke-skip gara-gara komentar
+    # yang kebetulan mengandung teks yang sama)
+    if grep -qE '^[[:space:]]*@load[[:space:]]+flowmeter[[:space:]]*$' "$LOCAL_ZEEK"; then
+        echo "[INFO] FlowMeter sudah di-load di local.zeek"
+        return
+    fi
+
+    echo "[INFO] Adding FlowMeter @load directive ke local.zeek..."
+    echo "[INFO] Path: $LOCAL_ZEEK"
+
+    # Backup. Script ini sudah divalidasi berjalan sebagai root (EUID=0) di awal,
+    # jadi tidak perlu "sudo" lagi di sini - "sudo" di dalam script yang sudah
+    # root justru jadi titik gagal baru kalau paket sudo tidak terinstall.
+    cp "$LOCAL_ZEEK" "$LOCAL_ZEEK.backup.$(date +%s)"
+
+    {
+        echo ""
+        echo "# Added by Web-IDS Capstone installer"
+        echo "@load flowmeter"
+    } >> "$LOCAL_ZEEK"
+
+    if grep -qE '^[[:space:]]*@load[[:space:]]+flowmeter[[:space:]]*$' "$LOCAL_ZEEK"; then
+        echo "[OK] FlowMeter @load directive berhasil ditambahkan ke local.zeek"
+    else
+        echo "[ERROR] Gagal menambahkan FlowMeter @load directive ke local.zeek"
+        return
+    fi
+
+    # Validasi konfigurasi Zeek setelah perubahan, supaya ketahuan dari sekarang
+    # kalau ada masalah (misalnya paket FlowMeter tidak benar-benar ke-copy ke
+    # ZEEKPATH), bukan baru ketahuan saat zeekctl start di akhir instalasi.
+    if command -v zeekctl &> /dev/null; then
+        echo "[INFO] Validasi konfigurasi Zeek via 'zeekctl check'..."
+        if zeekctl check; then
+            echo "[OK] Konfigurasi Zeek valid, FlowMeter siap dipakai."
+        else
+            echo "[WARNING] 'zeekctl check' melaporkan masalah setelah penambahan FlowMeter."
+            echo "[INFO] Cek manual: zeekctl check   |   cat $LOCAL_ZEEK"
+        fi
+    fi
+}
+
+# ==================================================
+# Configure Zeek Interface untuk EPEL Package (AlmaLinux)
+# ==================================================
+# Path: /etc/zeek/node.cfg (EPEL location)
+configure_zeek_epel() {
+    ZEEK_NODE_CONFIG="/etc/zeek/node.cfg"
+
+    if [ ! -f "$ZEEK_NODE_CONFIG" ]; then
+        echo "[WARNING] node.cfg tidak ditemukan"
+        return
+    fi
+
+    # Find active network interface (exclude lo, docker, etc)
+    INTERFACE=$(ip route | grep '^default' | awk '{print $5}' | head -1)
+
+    if [ -z "$INTERFACE" ]; then
+        # Fallback: gunakan interface pertama yang up (bukan loopback)
+        INTERFACE=$(ip link show | grep "^[0-9]" | grep "UP" | awk '{print $2}' | sed 's/:$//' | grep -v "^lo$" | head -1)
+    fi
+
+    if [ -z "$INTERFACE" ]; then
+        echo "[WARNING] Tidak bisa menemukan network interface aktif"
+        echo "[INFO] Edit manual: $ZEEK_NODE_CONFIG"
+        echo "[INFO] Set interface= ke interface yang ingin di-monitor"
+        return
+    fi
+
+    echo "[INFO] Network interface terdeteksi: $INTERFACE"
+
+    # Update node.cfg dengan interface
+    if grep -q "^interface=" "$ZEEK_NODE_CONFIG"; then
+        sudo sed -i "s/^interface=.*/interface=$INTERFACE/" "$ZEEK_NODE_CONFIG"
+    else
+        sudo sed -i "/^\[manager\]/a interface=$INTERFACE" "$ZEEK_NODE_CONFIG"
+    fi
+
+    echo "[OK] Zeek dikonfigurasi untuk interface: $INTERFACE"
+}
+
+# ==================================================
+# Install Zeek (CentOS/RHEL - Build from Source)
+# ==================================================
 install_zeek_yum_or_dnf() {
     if [ -x /opt/zeek/bin/zeek ]; then
         echo "[OK] Zeek sudah terinstall: $(/opt/zeek/bin/zeek --version)"
         return
     fi
 
-    echo "[INFO] Menambahkan repository Zeek untuk CentOS/RHEL..."
+    echo "[INFO] Menambahkan repository Zeek untuk $PRETTY_NAME..."
 
-    # Tentukan repository path berdasarkan versi
+    # Tentukan repository path berdasarkan OS dan versi
     if [ "$OS_ID" = "centos" ]; then
         if [ "$OS_VERSION" = "10" ]; then
             ZEEK_REPO_PATH="CentOS_Stream_10"
@@ -460,7 +709,7 @@ install_zeek_yum_or_dnf() {
         echo "[INFO] Menggunakan yum..."
         cat > /etc/yum.repos.d/security:zeek.repo <<EOF
 [security:zeek]
-name=Zeek repository for CentOS/RHEL
+name=Zeek repository for RHEL/CentOS/AlmaLinux
 baseurl=$ZEEK_REPO_URL
 gpgcheck=0
 enabled=1
@@ -584,6 +833,7 @@ configure_zeek() {
     export PATH="/opt/zeek/bin:$PATH"
 
     # Fix permission untuk Zeek spool dan logs directory
+    # Path: /opt/zeek/ (build-from-source location)
     echo "[INFO] Fix permission untuk Zeek directories..."
     sudo chown -R root:root /opt/zeek/spool 2>/dev/null || true
     sudo chmod -R 755 /opt/zeek/spool 2>/dev/null || true
@@ -824,11 +1074,13 @@ case "$OS_ID" in
         install_basic_dependencies_yum
         setup_python_environment
         install_filebeat_yum_or_dnf
-        if [ "$SKIP_ML" = true ]; then
-            echo "[INFO] SKIP: instalasi Zeek di-skip untuk CentOS."
-        else
-            install_zeek_yum_or_dnf
-        fi
+        install_zeek_yum_or_dnf
+        ;;
+    almalinux)
+        install_basic_dependencies_yum
+        setup_python_environment
+        install_filebeat_yum_or_dnf
+        install_zeek_from_epel
         ;;
     fedora)
         install_basic_dependencies_dnf
@@ -843,7 +1095,9 @@ case "$OS_ID" in
 esac
 
 if [ "$SKIP_ML" = true ]; then
-    echo "[INFO] SKIP: setup PATH Zeek dan instalasi FlowMeter di-skip untuk CentOS."
+    echo "[INFO] SKIP: setup PATH Zeek dan instalasi FlowMeter di-skip untuk $PRETTY_NAME."
+elif [ "$OS_ID" = "almalinux" ]; then
+    echo "[INFO] AlmaLinux EPEL Zeek sudah otomatis di-configure. Skip setup_zeek_path & configure_zeek."
 else
     setup_zeek_path
     configure_zeek
@@ -1036,7 +1290,7 @@ echo "======================================"
 echo ""
 
 if [ "$SKIP_ML" = true ]; then
-    echo "[INFO] ⚠️  CentOS Mode - fitur yang di-skip:"
+    echo "[INFO] ⚠️  $PRETTY_NAME Mode - fitur yang di-skip:"
     echo "  - ML Inference Worker (Zeek, FlowMeter)"
     echo ""
     echo "[INFO] Fitur yang aktif:"
@@ -1045,11 +1299,43 @@ if [ "$SKIP_ML" = true ]; then
     echo "  - Command logging"
     echo ""
 else
-    echo "[INFO] Ubuntu/Debian Mode - semua fitur aktif"
-    echo "  - ML Inference Worker (Zeek, FlowMeter)"
-    echo "  - File Malware Monitor (real-time inotify mode)"
-    echo "  - Filebeat untuk log collection"
-    echo "  - Command logging"
+    if [ "$OS_ID" = "almalinux" ]; then
+        echo "[INFO] $PRETTY_NAME - semua fitur aktif (FULL STACK)"
+        echo "  - Zeek untuk network IDS (versi 4.2.0)"
+        echo "  - FlowMeter untuk network metrics (via zkg)"
+        echo "  - ML Inference Worker"
+        echo "  - Filebeat untuk log collection"
+        echo "  - File Malware Monitor (real-time inotify mode)"
+        echo "  - Command logging"
+        echo ""
+    else
+        echo "[INFO] $PRETTY_NAME - semua fitur aktif (FULL STACK)"
+        echo "  - Zeek untuk network IDS"
+        echo "  - FlowMeter untuk network metrics"
+        echo "  - ML Inference Worker"
+        echo "  - Filebeat untuk log collection"
+        echo "  - File Malware Monitor (real-time inotify mode)"
+        echo "  - Command logging"
+        echo ""
+    fi
+    
+    # Info tentang Zeek installation method
+    if [ "$OS_ID" = "almalinux" ]; then
+        echo "[INFO] Zeek installation: dari EPEL repository (binary packages - ready to use)"
+        echo "[INFO] Zeek location: /usr/bin/zeek, /usr/bin/zeekctl (sudah di PATH)"
+        echo "[INFO] Config location: /etc/zeek/node.cfg (auto-configured)"
+        echo "[INFO] Network interface: otomatis terdeteksi & dikonfigurasi"
+        echo "[INFO] Logs location: /var/log/zeek/"
+        echo "[INFO] FlowMeter: installed via zkg (zeek package manager)"
+    elif [ "$OS_ID" = "ubuntu" ] || [ "$OS_ID" = "debian" ]; then
+        echo "[INFO] Zeek installation: build dari source (custom compilation)"
+        echo "[INFO] Zeek location: /opt/zeek/bin/"
+        echo "[INFO] Network interface: otomatis terdeteksi & dikonfigurasi"
+    else
+        echo "[INFO] Zeek installation: build dari source (custom compilation)"
+        echo "[INFO] Zeek location: /opt/zeek/bin/"
+        echo "[INFO] Network interface: otomatis terdeteksi & dikonfigurasi"
+    fi
     echo ""
 fi
 
@@ -1064,7 +1350,11 @@ echo ""
 echo "[INFO] Cek status services:"
 echo "  - Filebeat: systemctl status filebeat"
 if [ "$SKIP_ML" = false ]; then
-    echo "  - Zeek: zeekctl status"
+    if [ "$OS_ID" = "almalinux" ]; then
+        echo "  - Zeek (EPEL): zeekctl (sudah siap - tinggal deploy)"
+    else
+        echo "  - Zeek: zeekctl status"
+    fi
 fi
 echo ""
 echo "[INFO] Lihat logs:"
@@ -1079,4 +1369,16 @@ echo "[INFO] Cek konfigurasi:"
 echo "  - config.json: cat $BASE_DIR/config/config.json"
 echo "  - filebeat.yml: cat /etc/filebeat/filebeat.yml"
 echo "  - file monitor: cat $BASE_DIR/malware-file-monitor/watch_uploads.sh | head -5"
+echo ""
+
+if [ "$SKIP_ML" = false ] && [ "$OS_ID" = "almalinux" ]; then
+    echo "[INFO] Zeek Deployment Instructions (AlmaLinux EPEL):"
+    echo "  1. Deploy Zeek: sudo zeekctl deploy"
+    echo "  2. Start Zeek: sudo zeekctl start"
+    echo "  3. Check status: sudo zeekctl status"
+    echo "  4. View logs: sudo tail -f /var/log/zeek/current/zeek.log"
+    echo "  5. Monitor traffic: sudo tail -f /var/log/zeek/current/conn.log"
+    echo ""
+fi
+
 echo "======================================"
