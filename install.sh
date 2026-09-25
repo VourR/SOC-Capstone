@@ -45,6 +45,57 @@ OS_VERSION="${VERSION_ID}"
 echo "[INFO] OS terdeteksi: $PRETTY_NAME"
 
 # ==================================================
+# Tanya user: mau install ML Inference Worker atau tidak?
+# ==================================================
+# Ini KHUSUS untuk komponen ML inference worker (model scoring: pandas,
+# scikit-learn, joblib, artifacts.zip, proses inference_worker.py).
+# Zeek, FlowMeter, Filebeat, file monitor, dan command logging TETAP
+# terinstall apa pun jawabannya - itu bukan bagian dari "ML inferencing".
+#
+# Bisa juga di-skip interaktifnya pakai flag:
+#   ./install.sh --with-ml   -> langsung install ML tanpa nanya
+#   ./install.sh --no-ml     -> langsung skip ML tanpa nanya
+INSTALL_ML=true
+ML_FLAG=""
+for arg in "$@"; do
+    case "$arg" in
+        --with-ml) ML_FLAG="yes" ;;
+        --no-ml) ML_FLAG="no" ;;
+    esac
+done
+
+if [ -n "$ML_FLAG" ]; then
+    if [ "$ML_FLAG" = "yes" ]; then
+        INSTALL_ML=true
+        echo "[INFO] ML Inference Worker: diinstall (via flag --with-ml)."
+    else
+        INSTALL_ML=false
+        echo "[INFO] ML Inference Worker: di-skip (via flag --no-ml)."
+    fi
+elif [ -t 0 ]; then
+    echo ""
+    read -r -p "Install ML Inference Worker (model scoring pandas/scikit-learn)? [Y/n]: " ML_ANSWER
+    case "$ML_ANSWER" in
+        [nN]|[nN][oO])
+            INSTALL_ML=false
+            echo "[INFO] ML Inference Worker akan di-skip."
+            ;;
+        *)
+            INSTALL_ML=true
+            echo "[INFO] ML Inference Worker akan diinstall."
+            ;;
+    esac
+    echo ""
+else
+    # stdin bukan terminal (misal dijalankan lewat pipe/cron/CI) - default
+    # install ML supaya behavior tetap sama seperti versi sebelumnya kalau
+    # tidak ada interaksi sama sekali. Pakai --with-ml/--no-ml eksplisit
+    # untuk kontrol pasti di mode non-interaktif.
+    echo "[INFO] Mode non-interaktif terdeteksi, ML Inference Worker default: diinstall."
+    echo "[INFO] Gunakan --no-ml untuk skip ML tanpa prompt."
+fi
+
+# ==================================================
 # Flag untuk skip instalasi ML (inference worker, Zeek, FlowMeter)
 # ==================================================
 SKIP_ML=false
@@ -60,6 +111,34 @@ fi
 # ==================================================
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# ==================================================
+# Enable EPEL (untuk RHEL-family: AlmaLinux, RHEL, CentOS)
+# ==================================================
+# PENTING: sebelumnya EPEL cuma di-"set-enabled" di dalam
+# install_zeek_from_epel() - itu jalan SETELAH install_basic_dependencies_yum,
+# dan cuma mengasumsikan file /etc/yum.repos.d/epel.repo SUDAH ADA. Di sistem
+# yang benar-benar fresh, paket "epel-release" itu sendiri belum pernah
+# terinstall, jadi repo epel.repo tidak ada sama sekali - akibatnya paket
+# "inotify-tools" (yang cuma tersedia via EPEL) tidak ketemu, dan karena itu
+# digabung dalam satu transaksi dnf/yum bareng paket kritikal lain (curl,
+# python3, gcc, dst), SELURUH transaksi gagal -> seluruh script mati (set -e).
+#
+# Fix: install epel-release di awal, SEBELUM install dependency dasar apa pun,
+# supaya inotify-tools (dan zeek-zkg nantinya) sudah bisa ketemu dari awal.
+enable_epel() {
+    if rpm -q epel-release &>/dev/null; then
+        echo "[INFO] epel-release sudah terinstall."
+        return
+    fi
+
+    echo "[INFO] Menginstall epel-release..."
+    if command_exists dnf; then
+        dnf install -y epel-release || echo "[WARNING] Gagal install epel-release via dnf, lanjut tanpa EPEL."
+    elif command_exists yum; then
+        yum install -y epel-release || echo "[WARNING] Gagal install epel-release via yum, lanjut tanpa EPEL."
+    fi
 }
 
 install_basic_dependencies_apt() {
@@ -80,7 +159,17 @@ install_basic_dependencies_yum() {
     yum install -y curl wget gnupg ca-certificates git \
         python3 python3-pip python3-devel \
         gcc gcc-c++ make openssl-devel \
-        yum-utils unzip inotify-tools
+        yum-utils unzip
+
+    # inotify-tools dipisah dari transaksi utama - cuma tersedia via EPEL,
+    # dan kalau EPEL gagal/tidak ketemu, ini best-effort saja supaya paket
+    # kritikal di atas tetap terinstall (tidak ikut gagal semua gara-gara
+    # satu paket ini tidak ketemu). Kalau tetap gagal, file monitor otomatis
+    # fallback ke polling mode (lihat setup_file_monitor).
+    if ! yum install -y inotify-tools; then
+        echo "[WARNING] inotify-tools tidak ketemu (EPEL mungkin belum aktif)."
+        echo "[WARNING] File monitor akan pakai polling mode, bukan real-time inotify."
+    fi
 
     # Optional packages - jika tidak ada, skip
     echo "[INFO] Install optional packages..."
@@ -93,7 +182,13 @@ install_basic_dependencies_dnf() {
     dnf install -y curl wget gnupg ca-certificates git \
         python3 python3-pip python3-devel \
         gcc gcc-c++ make openssl-devel \
-        dnf-plugins-core unzip inotify-tools
+        dnf-plugins-core unzip
+
+    # inotify-tools dipisah - lihat catatan di install_basic_dependencies_yum
+    if ! dnf install -y inotify-tools; then
+        echo "[WARNING] inotify-tools tidak ketemu (EPEL mungkin belum aktif)."
+        echo "[WARNING] File monitor akan pakai polling mode, bukan real-time inotify."
+    fi
 
     echo "[INFO] Install build dependencies untuk Zeek..."
     dnf install -y cmake flex bison libpcap-devel zlib-devel
@@ -129,8 +224,8 @@ setup_python_environment() {
     echo "[INFO] Upgrade pip, setuptools, dan wheel..."
     pip3 install --upgrade pip setuptools wheel
 
-    if [ "$SKIP_ML" = true ]; then
-        echo "[INFO] SKIP: dependency ML inference worker (pandas, scikit-learn, joblib) di-skip untuk $PRETTY_NAME."
+    if [ "$SKIP_ML" = true ] || [ "$INSTALL_ML" = false ]; then
+        echo "[INFO] SKIP: dependency ML inference worker (pandas, scikit-learn, joblib) di-skip."
     else
         echo "[INFO] Install Python dependencies untuk ML inference worker..."
         
@@ -530,6 +625,22 @@ install_flowmeter_epel() {
         return
     fi
     echo "[INFO] zkg ditemukan: $ZKG_BIN"
+
+    # Paket "zeek-zkg" dari EPEL tidak membawa dependency Python-nya sendiri
+    # (GitPython, semantic-version) - tanpa ini, zkg langsung error dengan
+    # "ModuleNotFoundError: No module named 'git'" begitu dipanggil.
+    if ! "$ZKG_BIN" --version &> /dev/null; then
+        echo "[INFO] Install Python dependencies untuk zkg (GitPython, semantic-version)..."
+        pip3 install GitPython semantic-version || {
+            echo "[WARNING] Gagal install dependency zkg. FlowMeter kemungkinan tetap gagal."
+        }
+    fi
+
+    if ! "$ZKG_BIN" --version &> /dev/null; then
+        echo "[ERROR] zkg masih tidak bisa jalan setelah install dependency. FlowMeter skip."
+        "$ZKG_BIN" --version || true
+        return
+    fi
 
     # zkg butuh konfigurasi (state_dir/script_dir/plugin_dir) sebelum bisa install.
     # Paket zeek-zkg dari EPEL biasanya sudah punya config bawaan, tapi kalau belum
@@ -997,6 +1108,45 @@ setup_file_monitor() {
         fi
     fi
 
+    # PENTING: baris "cp" di atas cuma copy file apa adanya. Source file
+    # (watch_uploads_inotify.sh / watch_uploads_polling.sh, keduanya di-track
+    # di git) punya baris SCANNER="..." yang di-hardcode ke path development
+    # lama (misal /opt/webids-capstone/... atau /home/agent5/Capstone/...),
+    # bukan path instalasi yang sebenarnya. Kalau tidak diperbaiki, scanner
+    # tidak akan ketemu file_content_scanner.py di server manapun selain
+    # mesin development aslinya.
+    #
+    # Fix: timpa baris SCANNER= supaya selalu mengarah ke
+    # $BASE_DIR/malware-file-monitor/file_content_scanner.py sesuai lokasi
+    # instalasi saat ini. Ini dilakukan di DUA tempat:
+    #   1. Source template-nya sendiri (watch_uploads_inotify.sh /
+    #      watch_uploads_polling.sh) - supaya kalau file monitor mode
+    #      berganti nanti (inotify <-> polling) atau script di-copy manual,
+    #      path-nya tetap benar.
+    #   2. File aktif yang dipakai (watch_uploads.sh) - hasil cp di atas.
+    SCANNER_PATH="$MALWARE_DIR/file_content_scanner.py"
+    for f in "$WATCH_UPLOADS_INOTIFY" "$WATCH_UPLOADS_POLLING" "$WATCH_UPLOADS"; do
+        if [ -f "$f" ] && grep -q '^SCANNER=' "$f"; then
+            sed -i "s|^SCANNER=.*|SCANNER=\"$SCANNER_PATH\"|" "$f"
+            echo "[OK] SCANNER path di $(basename "$f") disesuaikan ke: $SCANNER_PATH"
+        fi
+    done
+
+    if [ ! -f "$SCANNER_PATH" ]; then
+        echo "[WARNING] $SCANNER_PATH tidak ditemukan - file monitor akan gagal saat dijalankan."
+    fi
+
+    # WATCH_DIR (direktori yang dipantau, misal /var/www/) tetap dari source
+    # file apa adanya, karena itu memang harus disesuaikan manual per server
+    # (tidak ada cara otomatis mendeteksi direktori upload aplikasi target).
+    # Tampilkan nilainya di sini supaya user sadar dan bisa cek/ubah kalau perlu.
+    if grep -q '^WATCH_DIR=' "$WATCH_UPLOADS"; then
+        CURRENT_WATCH_DIR="$(grep '^WATCH_DIR=' "$WATCH_UPLOADS" | head -1 | cut -d'"' -f2)"
+        echo "[INFO] WATCH_DIR saat ini: $CURRENT_WATCH_DIR"
+        echo "[INFO] Kalau direktori upload aplikasi kamu beda, edit manual:"
+        echo "       $WATCH_UPLOADS"
+    fi
+
     chmod +x "$WATCH_UPLOADS"
     echo "[OK] File monitor berhasil disetup."
 }
@@ -1050,12 +1200,15 @@ validate_project_files() {
         exit 1
     fi
 
-    if [ ! -f "$BASE_DIR/malware-file-monitor/watch_uploads.sh" ]; then
-        echo "[ERROR] malware-file-monitor/watch_uploads.sh tidak ditemukan"
+    # PENTING: watch_uploads.sh BELUM ADA di titik ini - file itu baru dibuat
+    # belakangan oleh setup_file_monitor() (hasil copy dari salah satu
+    # template di bawah). Validasi yang benar di sini adalah source
+    # template-nya, bukan hasil generate-nya.
+    if [ ! -f "$BASE_DIR/malware-file-monitor/watch_uploads_inotify.sh" ] && \
+       [ ! -f "$BASE_DIR/malware-file-monitor/watch_uploads_polling.sh" ]; then
+        echo "[ERROR] watch_uploads_inotify.sh / watch_uploads_polling.sh tidak ditemukan di malware-file-monitor/"
         exit 1
     fi
-
-    chmod +x "$BASE_DIR/malware-file-monitor/watch_uploads.sh"
 
     echo "[OK] Semua file project ditemukan."
 }
@@ -1071,18 +1224,21 @@ case "$OS_ID" in
         install_zeek_apt
         ;;
     centos|rhel)
+        enable_epel
         install_basic_dependencies_yum
         setup_python_environment
         install_filebeat_yum_or_dnf
         install_zeek_yum_or_dnf
         ;;
     almalinux)
+        enable_epel
         install_basic_dependencies_yum
         setup_python_environment
         install_filebeat_yum_or_dnf
         install_zeek_from_epel
         ;;
     fedora)
+        enable_epel
         install_basic_dependencies_dnf
         setup_python_environment
         install_filebeat_yum_or_dnf
@@ -1138,6 +1294,10 @@ artifacts_ready() {
 extract_artifacts() {
     if [ "$SKIP_ML" = true ]; then
         echo "[INFO] SKIP: ekstraksi ML artifacts di-skip untuk CentOS."
+        return
+    fi
+    if [ "$INSTALL_ML" = false ]; then
+        echo "[INFO] SKIP: ekstraksi ML artifacts di-skip (ML Inference Worker tidak dipilih)."
         return
     fi
 
@@ -1230,6 +1390,8 @@ start_services() {
     # Start ML Inference Worker
     if [ "$SKIP_ML" = true ]; then
         echo "[INFO] SKIP: ML inference worker tidak dijalankan (CentOS)."
+    elif [ "$INSTALL_ML" = false ]; then
+        echo "[INFO] SKIP: ML inference worker tidak dijalankan (tidak dipilih saat instalasi)."
     elif artifacts_ready; then
         echo "[INFO] Menjalankan ML inference worker..."
         CONFIG_FILE="$BASE_DIR/config/config.json"
@@ -1260,9 +1422,23 @@ start_services() {
     if [ ! -f "$WATCH_UPLOADS" ] || [ ! -x "$WATCH_UPLOADS" ]; then
         echo "[WARNING] watch_uploads.sh tidak ditemukan atau tidak executable"
         echo "[INFO] File monitor tidak dijalankan."
-    elif [ -f "$MALWARE_PID" ] && kill -0 "$(cat "$MALWARE_PID")" 2>/dev/null; then
-        echo "[INFO] watch_uploads.sh sudah berjalan dengan PID $(cat "$MALWARE_PID")"
     else
+        # PENTING: selalu restart (kill proses lama, start baru) alih-alih
+        # skip kalau sudah jalan. Alasannya: setup_file_monitor() di atas
+        # tadi bisa saja memperbaiki isi watch_uploads.sh (misal path
+        # SCANNER=), tapi proses lama yang sudah jalan tetap memakai
+        # variabel versi lama yang sudah ter-load ke memorinya - perbaikan
+        # di disk baru kepakai setelah proses-nya benar-benar direstart.
+        if [ -f "$MALWARE_PID" ] && kill -0 "$(cat "$MALWARE_PID")" 2>/dev/null; then
+            OLD_PID="$(cat "$MALWARE_PID")"
+            echo "[INFO] watch_uploads.sh sedang jalan (PID $OLD_PID) - restart supaya pakai script/path terbaru..."
+            kill "$OLD_PID" 2>/dev/null || true
+            # inotifywait/loop child process kadang tidak ikut mati langsung
+            # dari kill parent-nya - pastikan benar-benar berhenti dulu.
+            pkill -P "$OLD_PID" 2>/dev/null || true
+            sleep 1
+        fi
+
         cd "$MALWARE_DIR"
         nohup "$WATCH_UPLOADS" > "$MALWARE_LOG" 2>&1 &
         echo $! > "$MALWARE_PID"
@@ -1300,19 +1476,27 @@ if [ "$SKIP_ML" = true ]; then
     echo ""
 else
     if [ "$OS_ID" = "almalinux" ]; then
-        echo "[INFO] $PRETTY_NAME - semua fitur aktif (FULL STACK)"
+        echo "[INFO] $PRETTY_NAME - status fitur:"
         echo "  - Zeek untuk network IDS (versi 4.2.0)"
         echo "  - FlowMeter untuk network metrics (via zkg)"
-        echo "  - ML Inference Worker"
+        if [ "$INSTALL_ML" = true ]; then
+            echo "  - ML Inference Worker"
+        else
+            echo "  - ML Inference Worker: DI-SKIP (tidak dipilih saat instalasi)"
+        fi
         echo "  - Filebeat untuk log collection"
         echo "  - File Malware Monitor (real-time inotify mode)"
         echo "  - Command logging"
         echo ""
     else
-        echo "[INFO] $PRETTY_NAME - semua fitur aktif (FULL STACK)"
+        echo "[INFO] $PRETTY_NAME - status fitur:"
         echo "  - Zeek untuk network IDS"
         echo "  - FlowMeter untuk network metrics"
-        echo "  - ML Inference Worker"
+        if [ "$INSTALL_ML" = true ]; then
+            echo "  - ML Inference Worker"
+        else
+            echo "  - ML Inference Worker: DI-SKIP (tidak dipilih saat instalasi)"
+        fi
         echo "  - Filebeat untuk log collection"
         echo "  - File Malware Monitor (real-time inotify mode)"
         echo "  - Command logging"
@@ -1359,7 +1543,7 @@ fi
 echo ""
 echo "[INFO] Lihat logs:"
 echo "  - Filebeat: tail -f /var/log/filebeat/filebeat.log"
-if [ "$SKIP_ML" = false ]; then
+if [ "$SKIP_ML" = false ] && [ "$INSTALL_ML" = true ]; then
     echo "  - Inference: tail -f /var/log/Capstone/inference_worker.log"
 fi
 echo "  - Malware Monitor: tail -f /var/log/Capstone/malware_monitor.log"
