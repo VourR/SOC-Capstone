@@ -45,57 +45,6 @@ OS_VERSION="${VERSION_ID}"
 echo "[INFO] OS terdeteksi: $PRETTY_NAME"
 
 # ==================================================
-# Tanya user: mau install ML Inference Worker atau tidak?
-# ==================================================
-# Ini KHUSUS untuk komponen ML inference worker (model scoring: pandas,
-# scikit-learn, joblib, artifacts.zip, proses inference_worker.py).
-# Zeek, FlowMeter, Filebeat, file monitor, dan command logging TETAP
-# terinstall apa pun jawabannya - itu bukan bagian dari "ML inferencing".
-#
-# Bisa juga di-skip interaktifnya pakai flag:
-#   ./install.sh --with-ml   -> langsung install ML tanpa nanya
-#   ./install.sh --no-ml     -> langsung skip ML tanpa nanya
-INSTALL_ML=true
-ML_FLAG=""
-for arg in "$@"; do
-    case "$arg" in
-        --with-ml) ML_FLAG="yes" ;;
-        --no-ml) ML_FLAG="no" ;;
-    esac
-done
-
-if [ -n "$ML_FLAG" ]; then
-    if [ "$ML_FLAG" = "yes" ]; then
-        INSTALL_ML=true
-        echo "[INFO] ML Inference Worker: diinstall (via flag --with-ml)."
-    else
-        INSTALL_ML=false
-        echo "[INFO] ML Inference Worker: di-skip (via flag --no-ml)."
-    fi
-elif [ -t 0 ]; then
-    echo ""
-    read -r -p "Install ML Inference Worker (model scoring pandas/scikit-learn)? [Y/n]: " ML_ANSWER
-    case "$ML_ANSWER" in
-        [nN]|[nN][oO])
-            INSTALL_ML=false
-            echo "[INFO] ML Inference Worker akan di-skip."
-            ;;
-        *)
-            INSTALL_ML=true
-            echo "[INFO] ML Inference Worker akan diinstall."
-            ;;
-    esac
-    echo ""
-else
-    # stdin bukan terminal (misal dijalankan lewat pipe/cron/CI) - default
-    # install ML supaya behavior tetap sama seperti versi sebelumnya kalau
-    # tidak ada interaksi sama sekali. Pakai --with-ml/--no-ml eksplisit
-    # untuk kontrol pasti di mode non-interaktif.
-    echo "[INFO] Mode non-interaktif terdeteksi, ML Inference Worker default: diinstall."
-    echo "[INFO] Gunakan --no-ml untuk skip ML tanpa prompt."
-fi
-
-# ==================================================
 # Flag untuk skip instalasi ML (inference worker, Zeek, FlowMeter)
 # ==================================================
 SKIP_ML=false
@@ -111,34 +60,6 @@ fi
 # ==================================================
 command_exists() {
     command -v "$1" >/dev/null 2>&1
-}
-
-# ==================================================
-# Enable EPEL (untuk RHEL-family: AlmaLinux, RHEL, CentOS)
-# ==================================================
-# PENTING: sebelumnya EPEL cuma di-"set-enabled" di dalam
-# install_zeek_from_epel() - itu jalan SETELAH install_basic_dependencies_yum,
-# dan cuma mengasumsikan file /etc/yum.repos.d/epel.repo SUDAH ADA. Di sistem
-# yang benar-benar fresh, paket "epel-release" itu sendiri belum pernah
-# terinstall, jadi repo epel.repo tidak ada sama sekali - akibatnya paket
-# "inotify-tools" (yang cuma tersedia via EPEL) tidak ketemu, dan karena itu
-# digabung dalam satu transaksi dnf/yum bareng paket kritikal lain (curl,
-# python3, gcc, dst), SELURUH transaksi gagal -> seluruh script mati (set -e).
-#
-# Fix: install epel-release di awal, SEBELUM install dependency dasar apa pun,
-# supaya inotify-tools (dan zeek-zkg nantinya) sudah bisa ketemu dari awal.
-enable_epel() {
-    if rpm -q epel-release &>/dev/null; then
-        echo "[INFO] epel-release sudah terinstall."
-        return
-    fi
-
-    echo "[INFO] Menginstall epel-release..."
-    if command_exists dnf; then
-        dnf install -y epel-release || echo "[WARNING] Gagal install epel-release via dnf, lanjut tanpa EPEL."
-    elif command_exists yum; then
-        yum install -y epel-release || echo "[WARNING] Gagal install epel-release via yum, lanjut tanpa EPEL."
-    fi
 }
 
 install_basic_dependencies_apt() {
@@ -159,17 +80,7 @@ install_basic_dependencies_yum() {
     yum install -y curl wget gnupg ca-certificates git \
         python3 python3-pip python3-devel \
         gcc gcc-c++ make openssl-devel \
-        yum-utils unzip
-
-    # inotify-tools dipisah dari transaksi utama - cuma tersedia via EPEL,
-    # dan kalau EPEL gagal/tidak ketemu, ini best-effort saja supaya paket
-    # kritikal di atas tetap terinstall (tidak ikut gagal semua gara-gara
-    # satu paket ini tidak ketemu). Kalau tetap gagal, file monitor otomatis
-    # fallback ke polling mode (lihat setup_file_monitor).
-    if ! yum install -y inotify-tools; then
-        echo "[WARNING] inotify-tools tidak ketemu (EPEL mungkin belum aktif)."
-        echo "[WARNING] File monitor akan pakai polling mode, bukan real-time inotify."
-    fi
+        yum-utils unzip inotify-tools
 
     # Optional packages - jika tidak ada, skip
     echo "[INFO] Install optional packages..."
@@ -182,13 +93,7 @@ install_basic_dependencies_dnf() {
     dnf install -y curl wget gnupg ca-certificates git \
         python3 python3-pip python3-devel \
         gcc gcc-c++ make openssl-devel \
-        dnf-plugins-core unzip
-
-    # inotify-tools dipisah - lihat catatan di install_basic_dependencies_yum
-    if ! dnf install -y inotify-tools; then
-        echo "[WARNING] inotify-tools tidak ketemu (EPEL mungkin belum aktif)."
-        echo "[WARNING] File monitor akan pakai polling mode, bukan real-time inotify."
-    fi
+        dnf-plugins-core unzip inotify-tools
 
     echo "[INFO] Install build dependencies untuk Zeek..."
     dnf install -y cmake flex bison libpcap-devel zlib-devel
@@ -224,8 +129,8 @@ setup_python_environment() {
     echo "[INFO] Upgrade pip, setuptools, dan wheel..."
     pip3 install --upgrade pip setuptools wheel
 
-    if [ "$SKIP_ML" = true ] || [ "$INSTALL_ML" = false ]; then
-        echo "[INFO] SKIP: dependency ML inference worker (pandas, scikit-learn, joblib) di-skip."
+    if [ "$SKIP_ML" = true ]; then
+        echo "[INFO] SKIP: dependency ML inference worker (pandas, scikit-learn, joblib) di-skip untuk $PRETTY_NAME."
     else
         echo "[INFO] Install Python dependencies untuk ML inference worker..."
         
@@ -264,11 +169,18 @@ setup_python_environment() {
 generate_config_json() {
     echo "[INFO] Generate config.json dengan paths yang benar..."
 
+    # Zeek log paths - all OS use /opt/zeek/logs/current/
+    # (includes AlmaLinux EPEL, Ubuntu/Debian, RHEL/CentOS builds)
+    ZEEK_LOG_BASE="/opt/zeek/logs/current"
+
+    echo "[INFO] Using Zeek log base: $ZEEK_LOG_BASE"
+
     cat > "$BASE_DIR/config/config.json" <<EOF
 {
   "artifacts_dir": "$BASE_DIR/artifacts",
-  "conn_log_path": "/opt/zeek/logs/current/conn.log",
-  "flowmeter_log_path": "/opt/zeek/logs/current/flowmeter.log",
+  "conn_log_path": "$ZEEK_LOG_BASE/conn.log",
+  "flowmeter_log_path": "$ZEEK_LOG_BASE/flowmeter.log",
+  "http_log_path": "$ZEEK_LOG_BASE/http.log",
   "output_jsonl": "/var/log/Capstone/predictions.jsonl",
   "worker_log_path": "/var/log/Capstone/inference_worker.log",
   "state_dir": "$BASE_DIR/state",
@@ -290,7 +202,15 @@ generate_config_json() {
     "external": "external",
     "unknown": "Unknown"
   },
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "db_enabled": true,
+  "ml_db_host": "10.70.128.26",
+  "ml_db_port": 5432,
+  "ml_db_name": "capstone_ict",
+  "ml_db_user": "postgres",
+  "skip_local_noise": true,
+  "write_only_non_benign": true,
+  "skip_external_external": false
 }
 EOF
 
@@ -547,61 +467,47 @@ install_zeek_apt() {
 # Install Zeek dari EPEL Repository (AlmaLinux/RHEL)
 # ==================================================
 install_zeek_from_epel() {
-    # PENTING: sebelumnya function ini langsung "return" di sini kalau Zeek
-    # SUDAH terinstall (misal dari run install.sh sebelumnya) - akibatnya
-    # install_flowmeter_epel() di bagian bawah TIDAK PERNAH terpanggil sama
-    # sekali pada run kedua dan seterusnya, walaupun FlowMeter belum pernah
-    # berhasil ter-load. Ini penyebab utama "@load flowmeter" tidak pernah
-    # muncul di local.zeek meski script "sukses" tanpa error.
-    #
-    # Fix: kalau Zeek sudah terinstall, skip instalasi paket Zeek saja,
-    # tapi tetap lanjut cek/instal FlowMeter di bawah.
-    ZEEK_ALREADY_INSTALLED=false
     if command -v zeek &> /dev/null; then
         echo "[OK] Zeek sudah terinstall: $(zeek --version)"
-        ZEEK_ALREADY_INSTALLED=true
+        return
     fi
 
-    if [ "$ZEEK_ALREADY_INSTALLED" = false ]; then
-        echo "[INFO] Install Zeek dari EPEL repository..."
-
-        # Enable EPEL if not already
-        if ! grep -q "^enabled=1" /etc/yum.repos.d/epel.repo 2>/dev/null; then
-            echo "[INFO] Enabling EPEL repository..."
-            if command -v dnf &> /dev/null; then
-                sudo dnf config-manager --set-enabled epel || true
-            else
-                sudo yum-config-manager --enable epel || true
-            fi
-        fi
-
-        # Install zeek packages dari EPEL
-        echo "[INFO] Menginstall zeek-core, zeekctl, dan zeek-zkg dari EPEL..."
+    echo "[INFO] Install Zeek dari EPEL repository..."
+    
+    # Enable EPEL if not already
+    if ! grep -q "^enabled=1" /etc/yum.repos.d/epel.repo 2>/dev/null; then
+        echo "[INFO] Enabling EPEL repository..."
         if command -v dnf &> /dev/null; then
-            dnf install -y zeek-core zeekctl zeek-zkg
+            sudo dnf config-manager --set-enabled epel || true
         else
-            yum install -y zeek-core zeekctl zeek-zkg
+            sudo yum-config-manager --enable epel || true
         fi
-
-        # Fix EPEL paths (bukan /opt/zeek tapi /var/spool/zeek dan /var/log/zeek)
-        echo "[INFO] Fix permission untuk Zeek directories (EPEL paths)..."
-        sudo chown -R root:root /var/spool/zeek 2>/dev/null || true
-        sudo chmod -R 755 /var/spool/zeek 2>/dev/null || true
-        sudo chown -R root:root /var/log/zeek 2>/dev/null || true
-        sudo chmod -R 755 /var/log/zeek 2>/dev/null || true
-
-        # Auto-configure network interface untuk EPEL
-        echo "[INFO] Mengkonfigurasi Zeek network interface..."
-        configure_zeek_epel
-
-        echo "[OK] Zeek berhasil diinstall dari EPEL."
     fi
 
-    # Install FlowMeter plugin - SELALU dicek/dijalankan, baik Zeek baru
-    # diinstall maupun sudah ada dari sebelumnya. install_flowmeter_epel()
-    # sendiri sudah idempotent (skip kalau sudah ke-load di local.zeek).
+    # Install zeek packages dari EPEL
+    echo "[INFO] Menginstall zeek-core, zeekctl, dan zeek-zkg dari EPEL..."
+    if command -v dnf &> /dev/null; then
+        dnf install -y zeek-core zeekctl zeek-zkg
+    else
+        yum install -y zeek-core zeekctl zeek-zkg
+    fi
+
+    # Fix EPEL paths (bukan /opt/zeek tapi /var/spool/zeek dan /var/log/zeek)
+    echo "[INFO] Fix permission untuk Zeek directories (EPEL paths)..."
+    sudo chown -R root:root /var/spool/zeek 2>/dev/null || true
+    sudo chmod -R 755 /var/spool/zeek 2>/dev/null || true
+    sudo chown -R root:root /var/log/zeek 2>/dev/null || true
+    sudo chmod -R 755 /var/log/zeek 2>/dev/null || true
+
+    # Auto-configure network interface untuk EPEL
+    echo "[INFO] Mengkonfigurasi Zeek network interface..."
+    configure_zeek_epel
+
+    # Install FlowMeter plugin
     echo "[INFO] Install FlowMeter plugin via zkg..."
     install_flowmeter_epel
+
+    echo "[OK] Zeek berhasil diinstall dari EPEL."
 }
 
 # ==================================================
@@ -609,76 +515,22 @@ install_zeek_from_epel() {
 # ==================================================
 install_flowmeter_epel() {
     echo "[INFO] Installing FlowMeter plugin..."
-
-    # Cari binary zkg - bisa di PATH biasa atau di lokasi umum lainnya
-    ZKG_BIN=""
-    if command -v zkg &> /dev/null; then
-        ZKG_BIN="$(command -v zkg)"
-    elif [ -x /opt/zeek/bin/zkg ]; then
-        ZKG_BIN="/opt/zeek/bin/zkg"
-    elif [ -x /usr/bin/zkg ]; then
-        ZKG_BIN="/usr/bin/zkg"
-    fi
-
-    if [ -z "$ZKG_BIN" ]; then
-        echo "[WARNING] zkg tidak ditemukan (dicek di PATH, /opt/zeek/bin, /usr/bin). FlowMeter skip."
-        return
-    fi
-    echo "[INFO] zkg ditemukan: $ZKG_BIN"
-
-    # Paket "zeek-zkg" dari EPEL tidak membawa dependency Python-nya sendiri
-    # (GitPython, semantic-version) - tanpa ini, zkg langsung error dengan
-    # "ModuleNotFoundError: No module named 'git'" begitu dipanggil.
-    if ! "$ZKG_BIN" --version &> /dev/null; then
-        echo "[INFO] Install Python dependencies untuk zkg (GitPython, semantic-version)..."
-        pip3 install GitPython semantic-version || {
-            echo "[WARNING] Gagal install dependency zkg. FlowMeter kemungkinan tetap gagal."
-        }
-    fi
-
-    if ! "$ZKG_BIN" --version &> /dev/null; then
-        echo "[ERROR] zkg masih tidak bisa jalan setelah install dependency. FlowMeter skip."
-        "$ZKG_BIN" --version || true
+    
+    # Check jika zkg available
+    if ! command -v zkg &> /dev/null; then
+        echo "[WARNING] zkg tidak ditemukan. FlowMeter skip."
         return
     fi
 
-    # zkg butuh konfigurasi (state_dir/script_dir/plugin_dir) sebelum bisa install.
-    # Paket zeek-zkg dari EPEL biasanya sudah punya config bawaan, tapi kalau belum
-    # ada sama sekali, jalankan autoconfig dulu supaya tidak macet/gagal aneh.
-    if [ ! -f "$HOME/.zkg/config" ] && [ ! -f /etc/zkg/config ] && [ ! -f /root/.zkg/config ]; then
-        echo "[INFO] zkg belum ada konfigurasi, menjalankan '$ZKG_BIN autoconfig --force'..."
-        "$ZKG_BIN" autoconfig --force || true
-    fi
-
-    # Install FlowMeter via zkg menggunakan GitHub URL (tidak ada di zkg search index).
-    #
-    # PENTING - dua bug yang bikin FlowMeter GAGAL ter-load sebelumnya:
-    #   1. "zkg install ... | tail -3" -> exit status yang dicek oleh "if" adalah
-    #      punya "tail", BUKAN punya "zkg install". Jadi blok "berhasil" selalu
-    #      jalan meskipun instalasi FlowMeter aslinya gagal.
-    #   2. "zkg install" tanpa "--force" akan menampilkan prompt konfirmasi
-    #      interaktif (Y/n). Karena outputnya di-pipe ke "tail", prompt itu
-    #      tidak pernah terlihat di layar -> script seolah "diam"/hang, padahal
-    #      sebenarnya sedang menunggu input yang tidak pernah datang.
-    #
-    # Fix: output ditulis ke log file (bukan di-pipe langsung), exit code diambil
-    # dari zkg langsung, dan "--force" dipakai supaya tidak ada prompt interaktif.
+    # Install FlowMeter via zkg menggunakan GitHub URL (tidak ada di zkg search index)
     echo "[INFO] Installing FlowMeter dari GitHub..."
-    ZKG_LOG="/tmp/zkg_flowmeter_install.log"
-    "$ZKG_BIN" install --force https://github.com/zeek-flowmeter/zeek-flowmeter > "$ZKG_LOG" 2>&1
-    ZKG_STATUS=$?
-
-    echo "[INFO] --- output zkg install (20 baris terakhir) ---"
-    tail -20 "$ZKG_LOG"
-    echo "[INFO] --- log lengkap: $ZKG_LOG ---"
-
-    if [ "$ZKG_STATUS" -eq 0 ]; then
+    if zkg install https://github.com/zeek-flowmeter/zeek-flowmeter 2>&1 | tail -3; then
         echo "[OK] FlowMeter berhasil diinstall"
-
+        
         # Add @load directive ke local.zeek untuk load FlowMeter
-        load_flowmeter_in_local_zeek "$ZKG_BIN"
+        load_flowmeter_in_local_zeek
     else
-        echo "[WARNING] FlowMeter installation gagal (exit code $ZKG_STATUS). Lihat $ZKG_LOG untuk detail."
+        echo "[WARNING] FlowMeter installation gagal"
     fi
 }
 
@@ -686,61 +538,53 @@ install_flowmeter_epel() {
 # Load FlowMeter di local.zeek
 # ==================================================
 load_flowmeter_in_local_zeek() {
-    local ZKG_BIN="${1:-zkg}"
-
     # Detect path based on OS
     if [ "$OS_ID" = "almalinux" ]; then
         LOCAL_ZEEK="/usr/share/zeek/site/local.zeek"  # EPEL package path
     else
         LOCAL_ZEEK="/opt/zeek/etc/local.zeek"  # Build-from-source path (Ubuntu/Debian/RHEL/CentOS)
     fi
-
+    
     # Check jika file ada
     if [ ! -f "$LOCAL_ZEEK" ]; then
         echo "[WARNING] local.zeek tidak ditemukan di $LOCAL_ZEEK"
         return
     fi
-
-    # Check jika FlowMeter sudah di-load (anchor ^ supaya tidak ke-skip gara-gara komentar
-    # yang kebetulan mengandung teks yang sama)
-    if grep -qE '^[[:space:]]*@load[[:space:]]+flowmeter[[:space:]]*$' "$LOCAL_ZEEK"; then
+    
+    # Check jika FlowMeter sudah di-load
+    if grep -q "@load flowmeter" "$LOCAL_ZEEK"; then
         echo "[INFO] FlowMeter sudah di-load di local.zeek"
         return
     fi
-
+    
     echo "[INFO] Adding FlowMeter @load directive ke local.zeek..."
     echo "[INFO] Path: $LOCAL_ZEEK"
-
-    # Backup. Script ini sudah divalidasi berjalan sebagai root (EUID=0) di awal,
-    # jadi tidak perlu "sudo" lagi di sini - "sudo" di dalam script yang sudah
-    # root justru jadi titik gagal baru kalau paket sudo tidak terinstall.
-    cp "$LOCAL_ZEEK" "$LOCAL_ZEEK.backup.$(date +%s)"
-
-    {
-        echo ""
-        echo "# Added by Web-IDS Capstone installer"
-        echo "@load flowmeter"
-    } >> "$LOCAL_ZEEK"
-
-    if grep -qE '^[[:space:]]*@load[[:space:]]+flowmeter[[:space:]]*$' "$LOCAL_ZEEK"; then
-        echo "[OK] FlowMeter @load directive berhasil ditambahkan ke local.zeek"
-    else
-        echo "[ERROR] Gagal menambahkan FlowMeter @load directive ke local.zeek"
+    
+    # Backup
+    sudo cp "$LOCAL_ZEEK" "$LOCAL_ZEEK.backup.$(date +%s)"
+    
+    # Try method 1: sudo bash -c
+    sudo bash -c "echo '@load flowmeter' >> $LOCAL_ZEEK" && {
+        echo "[OK] FlowMeter @load directive added (method: bash -c)"
         return
-    fi
-
-    # Validasi konfigurasi Zeek setelah perubahan, supaya ketahuan dari sekarang
-    # kalau ada masalah (misalnya paket FlowMeter tidak benar-benar ke-copy ke
-    # ZEEKPATH), bukan baru ketahuan saat zeekctl start di akhir instalasi.
-    if command -v zeekctl &> /dev/null; then
-        echo "[INFO] Validasi konfigurasi Zeek via 'zeekctl check'..."
-        if zeekctl check; then
-            echo "[OK] Konfigurasi Zeek valid, FlowMeter siap dipakai."
-        else
-            echo "[WARNING] 'zeekctl check' melaporkan masalah setelah penambahan FlowMeter."
-            echo "[INFO] Cek manual: zeekctl check   |   cat $LOCAL_ZEEK"
-        fi
-    fi
+    }
+    
+    # Fallback method 2: sudo tee
+    echo "@load flowmeter" | sudo tee -a "$LOCAL_ZEEK" > /dev/null && {
+        echo "[OK] FlowMeter @load directive added (method: tee)"
+        return
+    }
+    
+    # If both fail, try echo | sudo cat > temp, then mv
+    echo "[WARNING] Both methods failed - trying alternative..."
+    echo "@load flowmeter" > /tmp/flowmeter_append.txt
+    sudo cat /tmp/flowmeter_append.txt >> "$LOCAL_ZEEK" 2>/dev/null && {
+        echo "[OK] FlowMeter @load directive added (method: cat)"
+        rm /tmp/flowmeter_append.txt
+        return
+    }
+    
+    echo "[ERROR] Failed to add FlowMeter @load directive"
 }
 
 # ==================================================
@@ -1108,45 +952,6 @@ setup_file_monitor() {
         fi
     fi
 
-    # PENTING: baris "cp" di atas cuma copy file apa adanya. Source file
-    # (watch_uploads_inotify.sh / watch_uploads_polling.sh, keduanya di-track
-    # di git) punya baris SCANNER="..." yang di-hardcode ke path development
-    # lama (misal /opt/webids-capstone/... atau /home/agent5/Capstone/...),
-    # bukan path instalasi yang sebenarnya. Kalau tidak diperbaiki, scanner
-    # tidak akan ketemu file_content_scanner.py di server manapun selain
-    # mesin development aslinya.
-    #
-    # Fix: timpa baris SCANNER= supaya selalu mengarah ke
-    # $BASE_DIR/malware-file-monitor/file_content_scanner.py sesuai lokasi
-    # instalasi saat ini. Ini dilakukan di DUA tempat:
-    #   1. Source template-nya sendiri (watch_uploads_inotify.sh /
-    #      watch_uploads_polling.sh) - supaya kalau file monitor mode
-    #      berganti nanti (inotify <-> polling) atau script di-copy manual,
-    #      path-nya tetap benar.
-    #   2. File aktif yang dipakai (watch_uploads.sh) - hasil cp di atas.
-    SCANNER_PATH="$MALWARE_DIR/file_content_scanner.py"
-    for f in "$WATCH_UPLOADS_INOTIFY" "$WATCH_UPLOADS_POLLING" "$WATCH_UPLOADS"; do
-        if [ -f "$f" ] && grep -q '^SCANNER=' "$f"; then
-            sed -i "s|^SCANNER=.*|SCANNER=\"$SCANNER_PATH\"|" "$f"
-            echo "[OK] SCANNER path di $(basename "$f") disesuaikan ke: $SCANNER_PATH"
-        fi
-    done
-
-    if [ ! -f "$SCANNER_PATH" ]; then
-        echo "[WARNING] $SCANNER_PATH tidak ditemukan - file monitor akan gagal saat dijalankan."
-    fi
-
-    # WATCH_DIR (direktori yang dipantau, misal /var/www/) tetap dari source
-    # file apa adanya, karena itu memang harus disesuaikan manual per server
-    # (tidak ada cara otomatis mendeteksi direktori upload aplikasi target).
-    # Tampilkan nilainya di sini supaya user sadar dan bisa cek/ubah kalau perlu.
-    if grep -q '^WATCH_DIR=' "$WATCH_UPLOADS"; then
-        CURRENT_WATCH_DIR="$(grep '^WATCH_DIR=' "$WATCH_UPLOADS" | head -1 | cut -d'"' -f2)"
-        echo "[INFO] WATCH_DIR saat ini: $CURRENT_WATCH_DIR"
-        echo "[INFO] Kalau direktori upload aplikasi kamu beda, edit manual:"
-        echo "       $WATCH_UPLOADS"
-    fi
-
     chmod +x "$WATCH_UPLOADS"
     echo "[OK] File monitor berhasil disetup."
 }
@@ -1200,15 +1005,12 @@ validate_project_files() {
         exit 1
     fi
 
-    # PENTING: watch_uploads.sh BELUM ADA di titik ini - file itu baru dibuat
-    # belakangan oleh setup_file_monitor() (hasil copy dari salah satu
-    # template di bawah). Validasi yang benar di sini adalah source
-    # template-nya, bukan hasil generate-nya.
-    if [ ! -f "$BASE_DIR/malware-file-monitor/watch_uploads_inotify.sh" ] && \
-       [ ! -f "$BASE_DIR/malware-file-monitor/watch_uploads_polling.sh" ]; then
-        echo "[ERROR] watch_uploads_inotify.sh / watch_uploads_polling.sh tidak ditemukan di malware-file-monitor/"
+    if [ ! -f "$BASE_DIR/malware-file-monitor/watch_uploads.sh" ]; then
+        echo "[ERROR] malware-file-monitor/watch_uploads.sh tidak ditemukan"
         exit 1
     fi
+
+    chmod +x "$BASE_DIR/malware-file-monitor/watch_uploads.sh"
 
     echo "[OK] Semua file project ditemukan."
 }
@@ -1224,21 +1026,18 @@ case "$OS_ID" in
         install_zeek_apt
         ;;
     centos|rhel)
-        enable_epel
         install_basic_dependencies_yum
         setup_python_environment
         install_filebeat_yum_or_dnf
         install_zeek_yum_or_dnf
         ;;
     almalinux)
-        enable_epel
         install_basic_dependencies_yum
         setup_python_environment
         install_filebeat_yum_or_dnf
         install_zeek_from_epel
         ;;
     fedora)
-        enable_epel
         install_basic_dependencies_dnf
         setup_python_environment
         install_filebeat_yum_or_dnf
@@ -1294,10 +1093,6 @@ artifacts_ready() {
 extract_artifacts() {
     if [ "$SKIP_ML" = true ]; then
         echo "[INFO] SKIP: ekstraksi ML artifacts di-skip untuk CentOS."
-        return
-    fi
-    if [ "$INSTALL_ML" = false ]; then
-        echo "[INFO] SKIP: ekstraksi ML artifacts di-skip (ML Inference Worker tidak dipilih)."
         return
     fi
 
@@ -1390,8 +1185,6 @@ start_services() {
     # Start ML Inference Worker
     if [ "$SKIP_ML" = true ]; then
         echo "[INFO] SKIP: ML inference worker tidak dijalankan (CentOS)."
-    elif [ "$INSTALL_ML" = false ]; then
-        echo "[INFO] SKIP: ML inference worker tidak dijalankan (tidak dipilih saat instalasi)."
     elif artifacts_ready; then
         echo "[INFO] Menjalankan ML inference worker..."
         CONFIG_FILE="$BASE_DIR/config/config.json"
@@ -1422,23 +1215,9 @@ start_services() {
     if [ ! -f "$WATCH_UPLOADS" ] || [ ! -x "$WATCH_UPLOADS" ]; then
         echo "[WARNING] watch_uploads.sh tidak ditemukan atau tidak executable"
         echo "[INFO] File monitor tidak dijalankan."
+    elif [ -f "$MALWARE_PID" ] && kill -0 "$(cat "$MALWARE_PID")" 2>/dev/null; then
+        echo "[INFO] watch_uploads.sh sudah berjalan dengan PID $(cat "$MALWARE_PID")"
     else
-        # PENTING: selalu restart (kill proses lama, start baru) alih-alih
-        # skip kalau sudah jalan. Alasannya: setup_file_monitor() di atas
-        # tadi bisa saja memperbaiki isi watch_uploads.sh (misal path
-        # SCANNER=), tapi proses lama yang sudah jalan tetap memakai
-        # variabel versi lama yang sudah ter-load ke memorinya - perbaikan
-        # di disk baru kepakai setelah proses-nya benar-benar direstart.
-        if [ -f "$MALWARE_PID" ] && kill -0 "$(cat "$MALWARE_PID")" 2>/dev/null; then
-            OLD_PID="$(cat "$MALWARE_PID")"
-            echo "[INFO] watch_uploads.sh sedang jalan (PID $OLD_PID) - restart supaya pakai script/path terbaru..."
-            kill "$OLD_PID" 2>/dev/null || true
-            # inotifywait/loop child process kadang tidak ikut mati langsung
-            # dari kill parent-nya - pastikan benar-benar berhenti dulu.
-            pkill -P "$OLD_PID" 2>/dev/null || true
-            sleep 1
-        fi
-
         cd "$MALWARE_DIR"
         nohup "$WATCH_UPLOADS" > "$MALWARE_LOG" 2>&1 &
         echo $! > "$MALWARE_PID"
@@ -1476,27 +1255,19 @@ if [ "$SKIP_ML" = true ]; then
     echo ""
 else
     if [ "$OS_ID" = "almalinux" ]; then
-        echo "[INFO] $PRETTY_NAME - status fitur:"
+        echo "[INFO] $PRETTY_NAME - semua fitur aktif (FULL STACK)"
         echo "  - Zeek untuk network IDS (versi 4.2.0)"
         echo "  - FlowMeter untuk network metrics (via zkg)"
-        if [ "$INSTALL_ML" = true ]; then
-            echo "  - ML Inference Worker"
-        else
-            echo "  - ML Inference Worker: DI-SKIP (tidak dipilih saat instalasi)"
-        fi
+        echo "  - ML Inference Worker"
         echo "  - Filebeat untuk log collection"
         echo "  - File Malware Monitor (real-time inotify mode)"
         echo "  - Command logging"
         echo ""
     else
-        echo "[INFO] $PRETTY_NAME - status fitur:"
+        echo "[INFO] $PRETTY_NAME - semua fitur aktif (FULL STACK)"
         echo "  - Zeek untuk network IDS"
         echo "  - FlowMeter untuk network metrics"
-        if [ "$INSTALL_ML" = true ]; then
-            echo "  - ML Inference Worker"
-        else
-            echo "  - ML Inference Worker: DI-SKIP (tidak dipilih saat instalasi)"
-        fi
+        echo "  - ML Inference Worker"
         echo "  - Filebeat untuk log collection"
         echo "  - File Malware Monitor (real-time inotify mode)"
         echo "  - Command logging"
@@ -1543,7 +1314,7 @@ fi
 echo ""
 echo "[INFO] Lihat logs:"
 echo "  - Filebeat: tail -f /var/log/filebeat/filebeat.log"
-if [ "$SKIP_ML" = false ] && [ "$INSTALL_ML" = true ]; then
+if [ "$SKIP_ML" = false ]; then
     echo "  - Inference: tail -f /var/log/Capstone/inference_worker.log"
 fi
 echo "  - Malware Monitor: tail -f /var/log/Capstone/malware_monitor.log"

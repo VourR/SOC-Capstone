@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-WEB-IDS23 Option B inference worker
+WEB-IDS23 Inference worker dengan real user IP extraction
 
 Pipeline:
-    Zeek live capture -> conn.log + flowmeter.log -> this worker
+    Zeek live capture -> conn.log + flowmeter.log + http.log -> this worker
     -> predictions.jsonl -> PostgreSQL ml_events.ml_predictions
 
-Perbaikan versi ini:
-- Tetap menulis hasil prediksi ke predictions.jsonl.
-- Hanya prediksi selain benign yang disimpan ke PostgreSQL.
-- Field yang memakai format ECS seperti source.ip, destination.ip, dan ml.predicted_label
-  tetap didukung.
-- Tabel ml_predictions dan unique index source_id dibuat otomatis jika belum ada.
-- Insert database dibuat lebih aman dengan JSON sanitizer agar numpy/pandas/NaN tidak
-  membuat insert JSONB gagal.
+Fitur:
+- Extract real user IP dari X-FORWARDED-FOR di http.log (behind FortWEB)
+- Match flowmeter + http berdasarkan uid
+- Replace source.ip dengan real IP di predictions
+- Auto-detect OS dan set log path yang tepat (AlmaLinux EPEL vs build-from-source)
 """
 
 from __future__ import annotations
@@ -23,6 +20,8 @@ import json
 import logging
 import math
 import os
+import platform
+import re
 import signal
 import sys
 import time
@@ -57,6 +56,37 @@ try:
     warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 except Exception:
     pass
+
+
+# ============================================================
+# OS Detection untuk path log yang benar
+# ============================================================
+
+def detect_zeek_log_base_path() -> Path:
+    """
+    Detect Zeek log base path - try multiple locations.
+    
+    Common paths:
+    - /opt/zeek/logs/ (build-from-source + AlmaLinux EPEL)
+    - /var/log/zeek/ (some EPEL packages)
+    - Fallback: /opt/zeek/logs/
+    """
+    # Try common paths in order
+    candidate_paths = [
+        Path("/opt/zeek/logs"),
+        Path("/var/log/zeek"),
+        Path("/opt/zeek/logs"),  # Fallback default
+    ]
+    
+    for path in candidate_paths:
+        if (path / "current").exists():
+            return path
+    
+    # Default - even if directory doesn't exist yet
+    return Path("/opt/zeek/logs")
+
+
+ZEEK_LOG_BASE = detect_zeek_log_base_path()
 
 
 # ============================================================
@@ -206,6 +236,22 @@ def json_safe(value: Any) -> Any:
         return value
 
     return str(value)
+
+
+def extract_real_ip_from_proxied(proxied_field: Optional[str]) -> Optional[str]:
+    """
+    Extract real user IP dari proxied field di http.log.
+    Format: "X-FORWARDED-FOR -> 114.10.142.194"
+    """
+    if not proxied_field or proxied_field == "(empty)":
+        return None
+
+    # Format: "X-FORWARDED-FOR -> IP_ADDRESS"
+    match = re.search(r'X-FORWARDED-FOR\s*->\s*(\S+)', str(proxied_field))
+    if match:
+        return match.group(1)
+
+    return None
 
 
 # ============================================================
@@ -474,15 +520,26 @@ class WebIDSInferenceWorker:
         state_dir = Path(cfg["state_dir"])
         state_dir.mkdir(parents=True, exist_ok=True)
 
+        # Auto-detect log paths based on OS (AlmaLinux EPEL vs build-from-source)
+        conn_log_path = Path(cfg.get("conn_log_path", ZEEK_LOG_BASE / "current" / "conn.log"))
+        flowmeter_log_path = Path(cfg.get("flowmeter_log_path", ZEEK_LOG_BASE / "current" / "flowmeter.log"))
+        http_log_path = Path(cfg.get("http_log_path", ZEEK_LOG_BASE / "current" / "http.log"))
+
         self.conn_tailer = ZeekAsciiTailer(
-            file_path=Path(cfg["conn_log_path"]),
+            file_path=conn_log_path,
             state_path=state_dir / "conn.state.json",
             start_at_end=cfg.get("start_at_end", True),
         )
 
         self.flow_tailer = ZeekAsciiTailer(
-            file_path=Path(cfg["flowmeter_log_path"]),
+            file_path=flowmeter_log_path,
             state_path=state_dir / "flowmeter.state.json",
+            start_at_end=cfg.get("start_at_end", True),
+        )
+
+        self.http_tailer = ZeekAsciiTailer(
+            file_path=http_log_path,
+            state_path=state_dir / "http.state.json",
             start_at_end=cfg.get("start_at_end", True),
         )
 
@@ -499,6 +556,7 @@ class WebIDSInferenceWorker:
 
         self.conn_cache: Dict[str, Dict[str, Any]] = {}
         self.pending_flows: Dict[str, Dict[str, Any]] = {}
+        self.real_ips: Dict[str, Optional[str]] = {}  # uid -> real IP dari X-FORWARDED-FOR
 
         self.scaled_numerical_cols = [
             col for col in self.preprocess_config["numerical_cols"] if col in self.feature_names
@@ -520,6 +578,11 @@ class WebIDSInferenceWorker:
             1723, 1883, 2049, 2375, 2376, 3306, 3389, 5060, 5432, 5672, 5900, 6379,
             8080, 8443, 9200, 9300, 11211, 27017,
         }
+
+        logging.info(f"Zeek log base path: {ZEEK_LOG_BASE}")
+        logging.info(f"conn.log: {conn_log_path}")
+        logging.info(f"flowmeter.log: {flowmeter_log_path}")
+        logging.info(f"http.log: {http_log_path}")
 
         if self.db_enabled:
             self._init_database()
@@ -600,6 +663,24 @@ class WebIDSInferenceWorker:
 
         finally:
             conn.close()
+
+    # --------------------------------------------------------
+    # Real IP extraction dari X-FORWARDED-FOR
+    # --------------------------------------------------------
+
+    def _handle_http_records(self, records: List[Dict[str, Any]]) -> None:
+        """Extract real user IP dari http.log X-FORWARDED-FOR header"""
+        for record in records:
+            uid = safe_str(record.get("uid"))
+            if not uid:
+                continue
+
+            proxied = safe_str(record.get("proxied"))
+            real_ip = extract_real_ip_from_proxied(proxied)
+
+            if real_ip:
+                self.real_ips[uid] = real_ip
+                logging.info(f"Extracted real IP for uid={uid}: {real_ip} (from proxied={proxied})")
 
     # --------------------------------------------------------
     # IP helpers
@@ -726,6 +807,7 @@ class WebIDSInferenceWorker:
         ]
         for uid in stale_conn:
             self.conn_cache.pop(uid, None)
+            self.real_ips.pop(uid, None)
 
         stale_pending = [
             uid for uid, value in self.pending_flows.items()
@@ -733,6 +815,7 @@ class WebIDSInferenceWorker:
         ]
         for uid in stale_pending:
             self.pending_flows.pop(uid, None)
+            self.real_ips.pop(uid, None)
 
     # --------------------------------------------------------
     # Conn metadata
@@ -931,12 +1014,20 @@ class WebIDSInferenceWorker:
         for col in X.columns:
             features[col] = json_safe(X.iloc[0][col])
 
+        # Get real user IP dari cache (jika tersedia dari http.log)
+        uid = meta["uid"]
+        gateway_ip = meta["id.orig_h"]  # IP gateway dari conn.log
+        real_source_ip = self.real_ips.get(uid)  # Real IP dari X-FORWARDED-FOR (bisa None)
+
+        # Use real IP jika ada, fallback ke gateway IP
+        display_ip = real_source_ip if real_source_ip else gateway_ip
+
         event = {
             "@timestamp": ts_to_iso_from_zeek(meta["ts"]) or pd.Timestamp.utcnow().isoformat(),
             "event.dataset": "webids.prediction",
             "event.kind": "event",
             "zeek.uid": meta["uid"],
-            "source.ip": meta["id.orig_h"],
+            "source.ip": display_ip,  # Use real IP jika ada, fallback ke gateway
             "source.port": meta["id.orig_p"],
             "destination.ip": meta["id.resp_h"],
             "destination.port": meta["id.resp_p"],
@@ -956,6 +1047,8 @@ class WebIDSInferenceWorker:
             "ml.model_name": self.model_name,
             "ml.model_version": self.model_version,
             "ml.features": features,
+            "zeek.gateway_ip": gateway_ip,  # Store gateway IP untuk tracking/debugging
+            "zeek.real_source_ip": real_source_ip,  # Store real IP (from X-FORWARDED-FOR)
         }
         return json_safe(event)
 
@@ -1040,7 +1133,7 @@ class WebIDSInferenceWorker:
                             event.get("@timestamp"),
                             source_id,
                             event.get("zeek.uid"),
-                            event.get("source.ip"),
+                            event.get("source.ip"),  # Real user IP (sudah dari X-FORWARDED-FOR)
                             event.get("source.port"),
                             event.get("destination.ip"),
                             event.get("destination.port"),
@@ -1080,14 +1173,16 @@ class WebIDSInferenceWorker:
             inserted = self._save_event_to_database(event)
             if inserted:
                 logging.info(
-                    "Inserted ML prediction to PostgreSQL uid=%s label=%s",
+                    "Inserted ML prediction to PostgreSQL uid=%s source_ip=%s label=%s",
                     event.get("zeek.uid"),
+                    event.get("source.ip"),
                     event.get("ml.predicted_label"),
                 )
             else:
                 logging.info(
-                    "ML prediction not inserted or duplicate uid=%s label=%s",
+                    "ML prediction not inserted or duplicate uid=%s source_ip=%s label=%s",
                     event.get("zeek.uid"),
+                    event.get("source.ip"),
                     event.get("ml.predicted_label"),
                 )
         except Exception as e:
@@ -1149,6 +1244,11 @@ class WebIDSInferenceWorker:
         logging.info("Inference worker started.")
         while self.running:
             try:
+                # Process HTTP logs dulu untuk extract real IPs
+                http_records = self.http_tailer.read_available(max_lines=self.batch_size)
+                if http_records:
+                    self._handle_http_records(http_records)
+
                 conn_records = self.conn_tailer.read_available(max_lines=self.batch_size)
                 if conn_records:
                     self._handle_conn_records(conn_records)
@@ -1159,7 +1259,7 @@ class WebIDSInferenceWorker:
 
                 self._cleanup_caches()
 
-                if not conn_records and not flow_records:
+                if not http_records and not conn_records and not flow_records:
                     time.sleep(self.poll_interval_seconds)
 
             except KeyboardInterrupt:
@@ -1203,4 +1303,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
