@@ -23,5 +23,5 @@
     "external": "external",
     "unknown": "Unknown"
   },
-  "log_level": "INFO"
+  "log_level": "ERROR"
 }

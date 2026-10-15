@@ -10,6 +10,10 @@ Fitur:
 - Extract real user IP dari X-FORWARDED-FOR di http.log (behind FortWEB)
 - Match flowmeter + http berdasarkan uid
 - Replace source.ip dengan real IP di predictions
+- Ambil post_body dari http.log (ekstensi zeek/corelight/log-add-http-post-bodies)
+  dan simpan ke predictions.jsonl saja (TIDAK dipush ke PostgreSQL)
+- Event HTTP ditahan sebentar (http_wait_seconds, default 2 detik) menunggu baris
+  http.log untuk uid yang sama, supaya http.uri / post_body / real IP tidak null
 - Auto-detect OS dan set log path yang tepat (AlmaLinux EPEL vs build-from-source)
 """
 
@@ -87,6 +91,10 @@ def detect_zeek_log_base_path() -> Path:
 
 
 ZEEK_LOG_BASE = detect_zeek_log_base_path()
+
+# Field event yang HANYA ditulis ke predictions.jsonl dan tidak boleh
+# dikirim ke PostgreSQL (termasuk ke kolom raw_event).
+DB_EXCLUDED_EVENT_FIELDS = {"http.post_body"}
 
 
 # ============================================================
@@ -238,28 +246,64 @@ def json_safe(value: Any) -> Any:
     return str(value)
 
 
-def extract_real_ip_from_proxied(proxied_field: Optional[str]) -> Optional[str]:
+def extract_real_ip_from_proxied(proxied_field: Any) -> Optional[str]:
     """
-    Extract real user IP dari proxied field di http.log.
-    Format: "X-FORWARDED-FOR -> 114.10.142.194"
+    Extract real user IP dari field ``proxied`` di http.log.
+
+    Pada Zeek JSON, ``proxied`` biasanya berbentuk list, misalnya:
+        ["X-FORWARDED-FOR -> 206.85.64.197"]
+
+    Fungsi ini juga tetap menerima string supaya kompatibel dengan format
+    log/konfigurasi lama.
     """
-    if not proxied_field or proxied_field == "(empty)":
+    if proxied_field is None:
         return None
 
-    # Format: "X-FORWARDED-FOR -> IP_ADDRESS"
-    match = re.search(r'X-FORWARDED-FOR\s*->\s*(\S+)', str(proxied_field))
-    if match:
-        return match.group(1)
+    # JSON Zeek dapat menyimpan proxied sebagai array.
+    if isinstance(proxied_field, (list, tuple, set)):
+        for item in proxied_field:
+            real_ip = extract_real_ip_from_proxied(item)
+            if real_ip:
+                return real_ip
+        return None
 
-    return None
+    if isinstance(proxied_field, dict):
+        for value in proxied_field.values():
+            real_ip = extract_real_ip_from_proxied(value)
+            if real_ip:
+                return real_ip
+        return None
+
+    value = str(proxied_field).strip()
+    if not value or value == "(empty)" or value == "-":
+        return None
+
+    # Format FortWEB/Zeek: "X-FORWARDED-FOR -> IP_ADDRESS"
+    match = re.search(
+        r"X-FORWARDED-FOR\s*->\s*([0-9A-Fa-f:.]+)",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    candidate = match.group(1)
+
+    # Pastikan hasil benar-benar alamat IP.
+    try:
+        ipaddress.ip_address(candidate)
+        return candidate
+    except ValueError:
+        return None
 
 
 # ============================================================
-# Zeek ASCII tailer
+# Zeek log tailer
 # ============================================================
 
 @dataclass
 class ZeekHeader:
+    """Header untuk format Zeek ASCII. JSON tidak membutuhkan header."""
     separator: str = "\t"
     set_separator: str = ","
     empty_field: str = "(empty)"
@@ -270,6 +314,22 @@ class ZeekHeader:
 
 
 class ZeekAsciiTailer:
+    """
+    Tailer yang mendukung dua format output Zeek:
+
+    1. Zeek ASCII:
+       #separator ...
+       #fields ...
+       #types ...
+       value1\tvalue2\t...
+
+    2. Zeek JSON:
+       {"ts": ..., "uid": ..., ...}
+
+    Nama class dipertahankan sebagai ZeekAsciiTailer agar tidak perlu
+    mengubah bagian konfigurasi/worker lain.
+    """
+
     def __init__(
         self,
         file_path: Path,
@@ -285,6 +345,7 @@ class ZeekAsciiTailer:
         self.inode: Optional[int] = None
         self.dev: Optional[int] = None
         self.offset: int = 0
+        self.format: Optional[str] = None  # "json" atau "ascii"
 
     def _load_state(self) -> Dict[str, Any]:
         if not self.state_path.exists():
@@ -302,11 +363,13 @@ class ZeekAsciiTailer:
             "inode": self.inode,
             "dev": self.dev,
             "offset": self.offset,
+            "format": self.format,
         }
         save_json_atomic(self.state_path, payload)
 
     def _reset_header(self) -> None:
         self.header = ZeekHeader()
+        self.format = None
 
     def _stat(self) -> Optional[os.stat_result]:
         try:
@@ -322,9 +385,11 @@ class ZeekAsciiTailer:
         if st is None:
             return False
 
+        # Log rotation/recreation.
         if self.inode != st.st_ino or self.dev != st.st_dev:
             return True
 
+        # File truncated.
         if self.offset > st.st_size:
             return True
 
@@ -378,17 +443,68 @@ class ZeekAsciiTailer:
             self.header.types = payload.split(self.header.separator)
             return
 
+    def _parse_json_record(self, line: str) -> Optional[Dict[str, Any]]:
+        """Parse satu baris JSON Zeek."""
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            logging.warning(
+                "Invalid JSON in %s at offset %s: %s. Line skipped.",
+                self.file_path,
+                self.offset,
+                exc,
+            )
+            return None
+
+        if not isinstance(record, dict):
+            logging.warning(
+                "JSON record in %s is not an object; line skipped.",
+                self.file_path,
+            )
+            return None
+
+        return record
+
     def _parse_record_line(self, line: str) -> Optional[Dict[str, Any]]:
-        line = line.rstrip("\n")
+        line = line.rstrip("\r\n")
         if not line:
             return None
 
-        if line.startswith("#"):
-            self._consume_header_line(line)
+        stripped = line.lstrip()
+
+        # ----------------------------------------------------
+        # JSON Zeek
+        # ----------------------------------------------------
+        # Current Zeek configuration menulis setiap event sebagai satu
+        # JSON object per baris. Tidak ada #fields/#types pada format ini.
+        if stripped.startswith("{"):
+            if self.format != "json":
+                self.format = "json"
+                logging.info("Detected Zeek JSON format: %s", self.file_path)
+            return self._parse_json_record(stripped)
+
+        # ----------------------------------------------------
+        # Zeek ASCII
+        # ----------------------------------------------------
+        if stripped.startswith("#"):
+            if self.format != "ascii":
+                self.format = "ascii"
+                logging.info("Detected Zeek ASCII format: %s", self.file_path)
+            self._consume_header_line(stripped)
+            return None
+
+        if self.format == "json":
+            logging.warning(
+                "Non-JSON line encountered in JSON Zeek log %s; line skipped.",
+                self.file_path,
+            )
             return None
 
         if not self.header.fields:
-            logging.warning("Header fields for %s not ready yet; skipping line.", self.file_path)
+            logging.warning(
+                "ASCII header fields for %s not ready yet; skipping line.",
+                self.file_path,
+            )
             return None
 
         parts = line.split(self.header.separator)
@@ -422,6 +538,8 @@ class ZeekAsciiTailer:
         self.inode = st.st_ino
         self.dev = st.st_dev
 
+        # Inspect the beginning of the file only to detect ASCII headers or
+        # JSON format. Setelah itu offset akan dikembalikan ke state/end.
         first_data_offset = 0
         while True:
             pos = self.fh.tell()
@@ -430,9 +548,22 @@ class ZeekAsciiTailer:
                 first_data_offset = self.fh.tell()
                 break
 
-            if line.startswith("#"):
-                self._consume_header_line(line)
+            stripped = line.lstrip()
+
+            if not stripped:
                 continue
+
+            if stripped.startswith("#"):
+                self.format = "ascii"
+                self._consume_header_line(stripped)
+                continue
+
+            if stripped.startswith("{"):
+                self.format = "json"
+            else:
+                # Tidak bisa memastikan format dari baris pertama.
+                # Simpan sebagai data offset dan biarkan parser menangani.
+                self.format = None
 
             first_data_offset = pos
             break
@@ -445,6 +576,9 @@ class ZeekAsciiTailer:
             and 0 <= saved["offset"] <= st.st_size
         ):
             self.fh.seek(saved["offset"])
+            # State lama tidak selalu mempunyai field format.
+            if saved.get("format") in ("json", "ascii"):
+                self.format = saved["format"]
         else:
             if self.start_at_end:
                 self.fh.seek(0, os.SEEK_END)
@@ -453,7 +587,12 @@ class ZeekAsciiTailer:
 
         self.offset = self.fh.tell()
         self._save_state()
-        logging.info("Opened %s at offset %s", self.file_path, self.offset)
+        logging.info(
+            "Opened %s at offset %s (format=%s)",
+            self.file_path,
+            self.offset,
+            self.format or "auto",
+        )
         return True
 
     def read_available(self, max_lines: int = 1000) -> List[Dict[str, Any]]:
@@ -557,6 +696,13 @@ class WebIDSInferenceWorker:
         self.conn_cache: Dict[str, Dict[str, Any]] = {}
         self.pending_flows: Dict[str, Dict[str, Any]] = {}
         self.real_ips: Dict[str, Optional[str]] = {}  # uid -> real IP dari X-FORWARDED-FOR
+        self.uris: Dict[str, Optional[str]] = {}  # uid -> uri dari http.log (payload URLs)
+        # uid -> post_body dari http.log (hanya untuk predictions.jsonl, tidak ke DB)
+        self.post_bodies: Dict[str, str] = {}
+        # [BARU] Event HTTP yang menunggu baris http.log: uid -> (event, batas_waktu_epoch)
+        # http_wait_seconds = 0 mematikan penundaan.
+        self.http_wait_seconds = float(cfg.get("http_wait_seconds", 2.0))
+        self.pending_events: Dict[str, Tuple[Dict[str, Any], float]] = {}
 
         self.scaled_numerical_cols = [
             col for col in self.preprocess_config["numerical_cols"] if col in self.feature_names
@@ -622,6 +768,7 @@ class WebIDSInferenceWorker:
                             protocol TEXT,
                             service TEXT,
                             traffic_direction TEXT,
+                            http_uri TEXT,
                             duration DOUBLE PRECISION,
                             orig_bytes BIGINT,
                             resp_bytes BIGINT,
@@ -669,18 +816,38 @@ class WebIDSInferenceWorker:
     # --------------------------------------------------------
 
     def _handle_http_records(self, records: List[Dict[str, Any]]) -> None:
-        """Extract real user IP dari http.log X-FORWARDED-FOR header"""
+        """Extract real user IP, URI, dan POST body dari http.log"""
         for record in records:
             uid = safe_str(record.get("uid"))
             if not uid:
                 continue
 
-            proxied = safe_str(record.get("proxied"))
+            # Extract real user IP dari X-FORWARDED-FOR.
+            # Jangan pakai safe_str() di sini karena Zeek JSON menyimpan
+            # proxied sebagai array, misalnya ["X-FORWARDED-FOR -> 1.2.3.4"].
+            proxied = record.get("proxied")
             real_ip = extract_real_ip_from_proxied(proxied)
-
             if real_ip:
                 self.real_ips[uid] = real_ip
-                logging.info(f"Extracted real IP for uid={uid}: {real_ip} (from proxied={proxied})")
+
+            # Extract URI (untuk track payload)
+            uri = safe_str(record.get("uri"))
+            if uri:
+                self.uris[uid] = uri
+                if real_ip:
+                    logging.info(f"uid={uid}: IP {real_ip} URI {uri}")
+                else:
+                    logging.info(f"uid={uid}: URI {uri}")
+
+            # Extract POST body (field dari zeek/corelight/log-add-http-post-bodies).
+            # Hanya dipakai untuk predictions.jsonl, TIDAK dikirim ke PostgreSQL.
+            # Sengaja tidak di-log karena bisa berisi kredensial.
+            post_body = safe_str(record.get("post_body"))
+            if post_body:
+                self.post_bodies[uid] = post_body
+
+            # [BARU] Jika ada event yang menunggu uid ini, lengkapi lalu tulis sekarang
+            self._release_pending_event(uid)
 
     # --------------------------------------------------------
     # IP helpers
@@ -808,6 +975,8 @@ class WebIDSInferenceWorker:
         for uid in stale_conn:
             self.conn_cache.pop(uid, None)
             self.real_ips.pop(uid, None)
+            self.uris.pop(uid, None)
+            self.post_bodies.pop(uid, None)
 
         stale_pending = [
             uid for uid, value in self.pending_flows.items()
@@ -816,6 +985,8 @@ class WebIDSInferenceWorker:
         for uid in stale_pending:
             self.pending_flows.pop(uid, None)
             self.real_ips.pop(uid, None)
+            self.uris.pop(uid, None)
+            self.post_bodies.pop(uid, None)
 
     # --------------------------------------------------------
     # Conn metadata
@@ -913,10 +1084,6 @@ class WebIDSInferenceWorker:
             "service": self._normalize_service(merged.get("service")),
             "traffic_direction": safe_str(merged.get("traffic_direction")),
             "duration": to_float(first_not_empty(merged.get("duration"), merged.get("flow_duration"))),
-            "orig_bytes": to_int(first_not_empty(merged.get("orig_bytes"), merged.get("orig_ip_bytes"))),
-            "resp_bytes": to_int(first_not_empty(merged.get("resp_bytes"), merged.get("resp_ip_bytes"))),
-            "orig_pkts": to_int(first_not_empty(merged.get("orig_pkts"), merged.get("orig_pkts_total"))),
-            "resp_pkts": to_int(first_not_empty(merged.get("resp_pkts"), merged.get("resp_pkts_total"))),
         }
 
         merged["service"] = meta["service"]
@@ -1018,6 +1185,8 @@ class WebIDSInferenceWorker:
         uid = meta["uid"]
         gateway_ip = meta["id.orig_h"]  # IP gateway dari conn.log
         real_source_ip = self.real_ips.get(uid)  # Real IP dari X-FORWARDED-FOR (bisa None)
+        uri = self.uris.get(uid)  # URI dari http.log (payload - track serangan)
+        post_body = self.post_bodies.get(uid)  # POST body dari http.log (bisa None)
 
         # Use real IP jika ada, fallback ke gateway IP
         display_ip = real_source_ip if real_source_ip else gateway_ip
@@ -1034,11 +1203,9 @@ class WebIDSInferenceWorker:
             "network.transport": meta["proto"],
             "network.service": meta["service"],
             "webids.traffic_direction": meta["traffic_direction"],
+            "http.uri": uri,  # URI dari http.log (contain payload/attack patterns)
+            "http.post_body": post_body,  # hanya ke JSONL, difilter dari DB (lihat DB_EXCLUDED_EVENT_FIELDS)
             "flow.duration": meta["duration"],
-            "source.bytes": meta["orig_bytes"],
-            "destination.bytes": meta["resp_bytes"],
-            "source.packets": meta["orig_pkts"],
-            "destination.packets": meta["resp_pkts"],
             "ml.predicted_label": pred_label,
             "ml.predicted_class": pred_label,
             "ml.confidence": confidence,
@@ -1069,11 +1236,20 @@ class WebIDSInferenceWorker:
                 str(event.get("ml.predicted_label") or ""),
             ])
 
+        # Buang field yang hanya boleh ada di JSONL (mis. http.post_body)
+        # supaya tidak ikut tersimpan di kolom raw_event.
+        db_event = {
+            k: v for k, v in event.items()
+            if k not in DB_EXCLUDED_EVENT_FIELDS
+        }
+
         conn = psycopg2.connect(**self.ml_db_config)
 
         try:
             with conn:
                 with conn.cursor() as cur:
+                    # Kolom orig_bytes, resp_bytes, orig_pkts, resp_pkts tidak lagi
+                    # diisi (tetap ada di tabel, nilainya NULL).
                     cur.execute(
                         """
                         INSERT INTO ml_predictions (
@@ -1087,11 +1263,8 @@ class WebIDSInferenceWorker:
                             protocol,
                             service,
                             traffic_direction,
+                            http_uri,
                             duration,
-                            orig_bytes,
-                            resp_bytes,
-                            orig_pkts,
-                            resp_pkts,
                             model_name,
                             model_version,
                             predicted_label,
@@ -1122,9 +1295,6 @@ class WebIDSInferenceWorker:
                             %s,
                             %s,
                             %s,
-                            %s,
-                            %s,
-                            %s,
                             %s
                         )
                         ON CONFLICT (source_id) WHERE source_id IS NOT NULL DO NOTHING
@@ -1140,11 +1310,8 @@ class WebIDSInferenceWorker:
                             event.get("network.transport"),
                             event.get("network.service"),
                             event.get("webids.traffic_direction"),
+                            event.get("http.uri"),  # Payload URI dari http.log
                             event.get("flow.duration"),
-                            event.get("source.bytes"),
-                            event.get("destination.bytes"),
-                            event.get("source.packets"),
-                            event.get("destination.packets"),
                             event.get("ml.model_name"),
                             event.get("ml.model_version"),
                             event.get("ml.predicted_label"),
@@ -1153,7 +1320,7 @@ class WebIDSInferenceWorker:
                             event.get("ml.is_attack"),
                             Json(json_safe(event.get("ml.probabilities", {}))),
                             Json(json_safe(event.get("ml.features", {}))),
-                            Json(json_safe(event)),
+                            Json(json_safe(db_event)),  # tanpa http.post_body
                         ),
                     )
 
@@ -1189,6 +1356,60 @@ class WebIDSInferenceWorker:
             logging.exception("Failed to insert ML prediction to PostgreSQL: %s", e)
 
     # --------------------------------------------------------
+    # [BARU] Penundaan event HTTP sampai baris http.log tiba
+    # --------------------------------------------------------
+
+    def _emit_event(self, event: Dict[str, Any]) -> None:
+        """
+        Tulis event. Untuk flow HTTP yang baris http.log-nya belum terbaca,
+        tahan dulu sampai baris itu tiba atau batas tunggu habis.
+        """
+        uid = event.get("zeek.uid")
+
+        if (
+            self.http_wait_seconds > 0
+            and uid
+            and event.get("network.service") == "http"
+            and event.get("http.uri") is None
+        ):
+            old = self.pending_events.pop(uid, None)
+            if old is not None:
+                self._write_event(old[0])
+
+            self.pending_events[uid] = (event, now_epoch() + self.http_wait_seconds)
+            return
+
+        self._write_event(event)
+
+    def _release_pending_event(self, uid: str) -> None:
+        """Dipanggil saat baris http.log untuk uid tiba: lengkapi event lalu tulis."""
+        item = self.pending_events.pop(uid, None)
+        if item is None:
+            return
+
+        event = item[0]
+        real_ip = self.real_ips.get(uid)
+
+        event["http.uri"] = self.uris.get(uid)
+        event["http.post_body"] = self.post_bodies.get(uid)
+        event["zeek.real_source_ip"] = real_ip
+        if real_ip:
+            event["source.ip"] = real_ip
+
+        self._write_event(event)
+
+    def _flush_pending_events(self, force: bool = False) -> None:
+        """Tulis event yang batas tunggunya habis (tanpa data http.log)."""
+        now = now_epoch()
+        expired = [
+            uid for uid, (_, deadline) in self.pending_events.items()
+            if force or now >= deadline
+        ]
+        for uid in expired:
+            event, _ = self.pending_events.pop(uid)
+            self._write_event(event)
+
+    # --------------------------------------------------------
     # Handlers
     # --------------------------------------------------------
 
@@ -1208,7 +1429,7 @@ class WebIDSInferenceWorker:
 
                 event = self._predict_one(pending, meta)
                 if event is not None:
-                    self._write_event(event)
+                    self._emit_event(event)  # [BARU] sebelumnya: self._write_event(event)
                     logging.info(
                         "Predicted pending flow uid=%s label=%s",
                         uid,
@@ -1233,7 +1454,7 @@ class WebIDSInferenceWorker:
 
             event = self._predict_one(record, conn_meta)
             if event is not None:
-                self._write_event(event)
+                self._emit_event(event)  # [BARU] sebelumnya: self._write_event(event)
                 logging.info("Predicted flow uid=%s label=%s", uid, event["ml.predicted_label"])
 
     # --------------------------------------------------------
@@ -1258,6 +1479,7 @@ class WebIDSInferenceWorker:
                     self._handle_flow_records(flow_records)
 
                 self._cleanup_caches()
+                self._flush_pending_events()  # [BARU] tulis event yang batas tunggunya habis
 
                 if not http_records and not conn_records and not flow_records:
                     time.sleep(self.poll_interval_seconds)
@@ -1269,6 +1491,7 @@ class WebIDSInferenceWorker:
                 logging.exception("Unhandled error in worker loop: %s", e)
                 time.sleep(self.poll_interval_seconds)
 
+        self._flush_pending_events(force=True)  # [BARU] jangan ada event yang hilang saat stop
         logging.info("Inference worker stopped.")
 
 
